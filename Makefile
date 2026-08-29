@@ -1,6 +1,8 @@
-.PHONY: run build test fmt lint web web-build clean
+.PHONY: run game build test fmt lint web web-build clean
 
-run:
+run: game
+
+game:
 	cargo run -p game
 
 build:
