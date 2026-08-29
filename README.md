@@ -11,6 +11,18 @@
 - 四種 Enemy:**Grunt**(中血中速)、**Runner**(低血高速)、**Tank**(高血低速),以及每 5 個 Wave 額外出現一次的 **Boss**(極高血量,目前無特殊機制)。
 - 每個 Level 15 個 Wave,通過即進入下個 Level(Tower 自動賣出退還 70%,Gold/Lives 沿用);通過最後一個 Level 的全部 Wave 即 Victory,Lives 歸零則 Defeat。
 
+## 開發用命令列(Command Palette)
+
+按 `` ` ``(Backquote / `~`)鍵開啟測試用命令列,直接輸入指令後按 Enter 執行、Esc 關閉:
+
+| 指令 | 說明 |
+| --- | --- |
+| `level <1..3>` | 直接跳到指定 Level(退還場上所有 Tower) |
+| `gold <amount>` | 設定目前 Gold |
+| `skipwave` | 瞬間清空進行中的 Wave(方便直接測試下一波) |
+
+此為開發/測試輔助工具,不會影響正式遊玩。
+
 ## 開發環境需求
 
 - [Rust](https://www.rust-lang.org/tools/install)(edition 2021)
