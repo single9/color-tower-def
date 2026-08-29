@@ -19,8 +19,11 @@ fn main() {
             ..default()
         }))
         .insert_resource(SimState(Simulation::new()))
-        .add_systems(Startup, (spawn_camera, spawn_grid, spawn_sidebar))
-        .add_systems(Update, interact_with_grid)
+        .add_systems(
+            Startup,
+            (spawn_camera, spawn_grid, spawn_sidebar, spawn_enemy),
+        )
+        .add_systems(Update, (interact_with_grid, move_enemy))
         .run();
 }
 
@@ -38,6 +41,11 @@ struct TowerAt(CellPos);
 /// be cleared before redrawing each frame.
 #[derive(Component)]
 struct PathPreviewTile;
+
+/// Marks the sprite entity representing the live Enemy. Ticket 03
+/// only has a single Enemy on screen at once.
+#[derive(Component)]
+struct EnemyMarker;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -77,6 +85,10 @@ fn tower_color() -> Color {
 
 fn path_preview_color() -> Color {
     Color::srgba(1.0, 1.0, 0.0, 0.35) // translucent yellow
+}
+
+fn enemy_color() -> Color {
+    Color::Srgba(css::LIME) // Grunt; other Enemy Kind land in ticket 05
 }
 
 fn cell_color(kind: CellKind) -> Color {
@@ -222,5 +234,47 @@ fn interact_with_grid(
             Transform::from_translation(cell_world_pos(hovered).with_z(1.0)),
             TowerAt(hovered),
         ));
+    }
+}
+
+fn spawn_enemy(mut commands: Commands, mut sim: ResMut<SimState>) {
+    sim.0.spawn_enemy();
+    let Some(transit) = sim.0.enemy_transit() else {
+        return;
+    };
+    commands.spawn((
+        Sprite {
+            color: enemy_color(),
+            custom_size: Some(Vec2::splat(CELL_SIZE_PX * 0.6)),
+            ..default()
+        },
+        Transform::from_translation(cell_world_pos(transit.from).with_z(2.0)),
+        EnemyMarker,
+    ));
+}
+
+/// Advances the `simulation` Enemy and mirrors its position onto the
+/// Bevy sprite, interpolating between the two Cell centers of its
+/// current transit segment. Despawns the sprite once the Enemy
+/// reaches Goal and `simulation` drops it.
+fn move_enemy(
+    time: Res<Time>,
+    mut sim: ResMut<SimState>,
+    mut commands: Commands,
+    mut enemy_sprite: Query<(Entity, &mut Transform), With<EnemyMarker>>,
+) {
+    sim.0.tick(time.delta_secs());
+
+    let Ok((entity, mut transform)) = enemy_sprite.get_single_mut() else {
+        return;
+    };
+
+    match sim.0.enemy_transit() {
+        Some(transit) => {
+            let from = cell_world_pos(transit.from);
+            let to = cell_world_pos(transit.to);
+            transform.translation = from.lerp(to, transit.progress).with_z(2.0);
+        }
+        None => commands.entity(entity).despawn(),
     }
 }

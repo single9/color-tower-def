@@ -4,10 +4,15 @@
 
 **Blocked by:** 02 (Place and sell a single Tower Kind, with the Blocking Rule enforced)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] A Grunt-stat Enemy spawns at the Spawn Cell and visibly moves cell-by-cell toward the Goal Cell
-- [ ] Placing or selling a Tower while the Enemy is mid-Cell does not change its current heading; the change is only reflected once it reaches the next Cell center
-- [ ] Placing a Tower that changes the shortest route causes the Enemy to take the new route starting from its next Cell-center recalculation
-- [ ] Reaching the Goal Cell despawns the Enemy
-- [ ] `simulation` unit tests cover: an Enemy mid-Cell keeps its stored Path across a Grid mutation; an Enemy that has just reached a Cell center recomputes and picks up a changed Grid
+- [x] A Grunt-stat Enemy spawns at the Spawn Cell and visibly moves cell-by-cell toward the Goal Cell
+- [x] Placing or selling a Tower while the Enemy is mid-Cell does not change its current heading; the change is only reflected once it reaches the next Cell center
+- [x] Placing a Tower that changes the shortest route causes the Enemy to take the new route starting from its next Cell-center recalculation
+- [x] Reaching the Goal Cell despawns the Enemy
+- [x] `simulation` unit tests cover: an Enemy mid-Cell keeps its stored Path across a Grid mutation; an Enemy that has just reached a Cell center recomputes and picks up a changed Grid
+
+## Verification
+
+- `cargo test --workspace`: 12/12 `simulation` unit tests pass (4 new: spawn heading, mid-Cell Path stability, cell-center recompute picking up a new Tower, Goal despawn).
+- Manually driven end-to-end via synthetic X11 input against the running Bevy window (screenshots inspected): Enemy spawns and walks the straight row toward Goal; a Tower placed several cells ahead is left alone while the Enemy is still mid-Cell; once it reaches the next Cell center it detours around the Tower; it reaches Goal and the sprite despawns.
