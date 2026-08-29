@@ -18,3 +18,7 @@
 - `cargo test --workspace`: 29/29 `simulation` unit tests pass (4 new: upgrading increases damage 30% per Tier and deducts a flat cost; upgrade is blocked at Tier 3; upgrade is blocked when unaffordable and state is unchanged; selling an upgraded Tower refunds 70% of purchase plus upgrade spend).
 - Decided and documented in `CONTEXT.md`'s Tier entry: Frost's primary stat (the one Tiers scale) is Range, since it has no damage; Cannon/Gatling's primary stat is damage.
 - Manually driven end-to-end via synthetic X11 input against the running Bevy window (screenshots inspected): placing a Cannon then clicking it again opens the sidebar info panel ("Cannon (Tier 1)", "Damage: 50", Upgrade (80g), Sell) instead of instantly selling it; clicking Upgrade moves it to Tier 2 with Damage 65 (50 × 1.3) and Gold dropping by 80; clicking Upgrade again while unaffordable (Gold 20 < 80) is a silent no-op — still Tier 2, Gold unchanged; clicking Sell refunds 70% of (100 + 80) = 126 Gold, despawns the Tower sprite, and closes the panel.
+
+## Comments
+
+- UI follow-up (2026-08-30): upgrading and selling now require an explicit confirmation dialog before committing. The verification notes above describe the earlier direct-click behavior; the info panel upgrades/sells via a Confirm/Cancel dialog in the game layer.

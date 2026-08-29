@@ -16,3 +16,7 @@
 
 - `cargo test --workspace`: 8/8 `simulation` unit tests pass, covering the Blocking Rule (full-seal rejection + narrow-gap success), duplicate/Spawn/Goal placement rejection, and sell freeing the Cell.
 - Manually driven via synthetic X11 input against the running Bevy window (screenshots inspected): hover shows the yellow Path preview, a click places a red Tower, clicking it again sells it, and attempting to enclose Spawn's third and last open neighbor is silently rejected (Cell stays Buildable) while the first two succeed.
+
+## Comments
+
+- UI follow-up (2026-08-30): selling now requires an explicit confirmation dialog (Cancel/backdrop dismisses, Confirm commits) instead of acting on the info panel click directly. The verification note above describes the earlier direct-click behavior.

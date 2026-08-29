@@ -25,8 +25,8 @@ Build the full MVP game loop described in `CONTEXT.md`: a single fixed 25x25 Gri
 11. As a player, I want a Frost tower's Slow Aura to stop affecting an Enemy the instant it leaves Range, so that the effect is predictable and non-sticky.
 12. As a player, I want Projectile fired by Cannon/Gatling to track their target and always hit (barring the target dying first), so that I'm never frustrated by wasted shots.
 13. As a player, I want to click an already-placed Tower to open a panel showing its Tower Kind, Tier, and stats, so that I can make informed upgrade/sell decisions.
-14. As a player, I want to upgrade a selected Tower up to Tier 3, each Tier costing Gold and increasing its main stat by 30%, so that I have a mid-game power progression.
-15. As a player, I want to sell a selected Tower for 70% of its total Gold spent (purchase + upgrades), so that I can rework my maze without losing all my investment.
+14. As a player, I want to upgrade a selected Tower up to Tier 3, each Tier costing Gold and increasing its main stat by 30%, so that I have a mid-game power progression. Upgrade (and Sell below) require an explicit confirmation dialog before committing, so an accidental click can't spend Gold.
+15. As a player, I want to sell a selected Tower for 70% of its total Gold spent (purchase + upgrades), so that I can rework my maze without losing all my investment. Selling requires an explicit confirmation dialog before the Tower is removed.
 16. As a player, I want to start with a fixed amount of Gold, so that early-game strategy is constrained.
 17. As a player, I want to earn Gold when an Enemy dies, with the amount depending on Enemy Kind, so that harder kills feel more rewarding.
 18. As a player, I want three Enemy Kind — Grunt (medium Health, medium speed), Runner (low Health, high speed), Tank (high Health, low speed) — so that different Tower Kind have distinct counters.
@@ -54,7 +54,7 @@ Build the full MVP game loop described in `CONTEXT.md`: a single fixed 25x25 Gri
  - **Economy**: starting Gold of 180 (a playtesting decision; recorded as the `STARTING_GOLD` constant, not scattered magic numbers). Tower purchase price is fixed per Tower Kind. Selling refunds 70% of total Gold spent on that Tower (purchase price plus any upgrade costs paid).
  - **Wave scaling**: 15 Wave total. Wave *n* spawns `5 + n + floor(0.1 * n * n)` Enemy (plus quadratic growth, so later Waves spike). Each Enemy's Health for Wave *n* is `base_health * (1 + n * 0.15)`. Within a Wave, Enemies spawn one at a time at the Spawn Cell, initially 0.8s apart but shrinking by 0.02s per Wave to a 0.3s floor.
 - **Win/lose**: Victory triggers when Wave 15 is cleared (all its Enemy are dead) and Lives > 0. Defeat triggers the instant Lives reaches 0, even mid-Wave.
-- **Screen layout**: 700x500 window — 500x500 Grid area on the left, 200px sidebar on the right showing Gold, Lives, Wave number, Tower Kind selection buttons, and (when a Tower is selected) its info/upgrade/sell panel.
+- **Screen layout**: 700x700 window — 500x500 Grid area on the left (vertically centered), 200px sidebar on the right showing Gold, Lives, Wave number, Tower Kind selection buttons, and (when a Tower is selected) its info/upgrade/sell panel. The extra 200px of window height gives the sidebar room for the info panel without clipping. Upgrading and selling a Tower each show a confirmation dialog (Confirm/Cancel) before committing.
 - **Visual palette**: Grid uses a neutral palette distinct from Tower colors — Buildable = light gray, Spawn = dark purple, Goal = orange, Path preview overlay = translucent yellow. Tower Kind colors: Cannon = red, Gatling = green, Frost = blue.
 - **No main menu, no pause, no audio** — confirmed explicitly out of scope for this MVP (see Out of Scope).
 
