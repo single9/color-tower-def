@@ -29,6 +29,7 @@ fn main() {
         .insert_resource(SelectedTowerKind(TowerKind::Cannon))
         .insert_resource(SelectedTower(None))
         .insert_resource(CommandPalette::default())
+        .insert_resource(PendingConfirm(None))
         .add_systems(
             Startup,
             (
@@ -37,6 +38,7 @@ fn main() {
                 spawn_sidebar,
                 spawn_result_overlay,
                 spawn_command_palette,
+                spawn_confirm_dialog,
             ),
         )
         .add_systems(
@@ -52,6 +54,7 @@ fn main() {
                 toggle_command_palette,
                 type_into_command_palette,
                 sync_command_palette_ui,
+                (handle_confirm_dialog, sync_confirm_dialog).chain(),
                 tick_simulation,
                 sync_enemies,
                 sync_projectiles,
@@ -181,6 +184,37 @@ struct CommandPaletteInputText;
 /// The Command Palette's help/result line, shown under the input line.
 #[derive(Component)]
 struct CommandPaletteMessageText;
+
+/// A Tower action the player is being asked to confirm. Set by the info
+/// panel's Upgrade/Sell buttons; drives the confirmation dialog.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfirmAction {
+    Upgrade(CellPos),
+    Sell(CellPos),
+}
+
+/// The Tower action awaiting confirmation, if any. `Some` shows the
+/// confirmation dialog; `None` hides it.
+#[derive(Resource, Default)]
+struct PendingConfirm(Option<ConfirmAction>);
+
+/// The confirmation dialog's root Node, toggled between `Visibility::Visible`
+/// and `Visibility::Hidden` as `PendingConfirm` changes.
+#[derive(Component)]
+struct ConfirmDialogRoot;
+
+/// The full-window dimming backdrop behind the confirmation dialog;
+/// clicking it cancels the pending action.
+#[derive(Component)]
+struct ConfirmDialogBackdrop;
+
+/// The dialog's "Confirm" button: commits the pending action.
+#[derive(Component)]
+struct ConfirmDialogConfirmButton;
+
+/// The dialog's "Cancel" button: dismisses the pending action.
+#[derive(Component)]
+struct ConfirmDialogCancelButton;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -561,16 +595,14 @@ fn range_ring_color() -> Color {
 }
 
 /// Handles clicks on the info panel's Upgrade/Sell buttons for
-/// whichever Tower `SelectedTower` currently points at. Failed
-/// attempts (already Tier 3, unaffordable) are simply no-ops, mirroring
-/// how `interact_with_grid` already treats a failed placement.
+/// whichever Tower `SelectedTower` currently points at. Rather than
+/// acting immediately, either press opens a confirmation dialog (see
+/// `handle_confirm_dialog`) the player must explicitly commit.
 fn handle_tower_panel_buttons(
-    mut commands: Commands,
-    mut sim: ResMut<SimState>,
-    mut selected_tower: ResMut<SelectedTower>,
-    towers: Query<(Entity, &TowerAt)>,
+    selected_tower: ResMut<SelectedTower>,
     upgrade_interactions: Query<&Interaction, (With<UpgradeButton>, Changed<Interaction>)>,
     sell_interactions: Query<&Interaction, (With<SellButton>, Changed<Interaction>)>,
+    mut pending: ResMut<PendingConfirm>,
 ) {
     let Some(pos) = selected_tower.0 else {
         return;
@@ -578,14 +610,13 @@ fn handle_tower_panel_buttons(
 
     for interaction in &upgrade_interactions {
         if *interaction == Interaction::Pressed {
-            let _ = sim.0.upgrade_tower(pos);
+            pending.0 = Some(ConfirmAction::Upgrade(pos));
         }
     }
 
     for interaction in &sell_interactions {
-        if *interaction == Interaction::Pressed && sim.0.sell_tower(pos) {
-            despawn_tower_sprite(&mut commands, &towers, pos);
-            selected_tower.0 = None;
+        if *interaction == Interaction::Pressed {
+            pending.0 = Some(ConfirmAction::Sell(pos));
         }
     }
 }
@@ -1111,5 +1142,169 @@ fn sync_command_palette_ui(
     }
     if let Ok(mut text) = message_text.get_single_mut() {
         text.0 = palette.message.clone().unwrap_or_else(command_palette_help);
+    }
+}
+
+/// Spawns the (initially hidden) full-window container the confirmation
+/// dialog is rebuilt into whenever `PendingConfirm` changes.
+fn spawn_confirm_dialog(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            position_type: PositionType::Absolute,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        Visibility::Hidden,
+        ConfirmDialogRoot,
+    ));
+}
+
+/// Rebuilds the confirmation dialog whenever `PendingConfirm` changes:
+/// hidden (and transparent) while nothing awaits confirmation, otherwise
+/// a dimming backdrop plus a message and Confirm/Cancel buttons.
+fn sync_confirm_dialog(
+    mut commands: Commands,
+    pending: Res<PendingConfirm>,
+    root: Query<Entity, With<ConfirmDialogRoot>>,
+    children: Query<&Children>,
+    mut last_rendered: Local<Option<ConfirmAction>>,
+) {
+    let Ok(root) = root.get_single() else {
+        return;
+    };
+
+    if pending.0 == *last_rendered {
+        return;
+    }
+    *last_rendered = pending.0;
+
+    if let Ok(existing_children) = children.get(root) {
+        for &child in existing_children {
+            commands.entity(child).despawn_recursive();
+        }
+    }
+
+    let Some(action) = pending.0 else {
+        commands.entity(root).insert(Visibility::Hidden);
+        return;
+    };
+    commands.entity(root).insert(Visibility::Visible);
+
+    commands.entity(root).with_children(|overlay| {
+        overlay.spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+            Interaction::default(),
+            ConfirmDialogBackdrop,
+        ));
+
+        overlay
+            .spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(16.0),
+                    padding: UiRect::all(Val::Px(24.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.15, 0.15, 0.18)),
+            ))
+            .with_children(|panel| {
+                let message = match action {
+                    ConfirmAction::Upgrade(_) => "Upgrade this tower?",
+                    ConfirmAction::Sell(_) => "Sell this tower?",
+                };
+                panel.spawn((Text::new(message), TextColor(Color::WHITE)));
+                panel
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(12.0),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|row| {
+                        row.spawn((
+                            Button,
+                            Node {
+                                padding: UiRect::all(Val::Px(10.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                            ConfirmDialogCancelButton,
+                        ))
+                        .with_children(|button| {
+                            button.spawn((Text::new("Cancel"), TextColor(Color::WHITE)));
+                        });
+                        row.spawn((
+                            Button,
+                            Node {
+                                padding: UiRect::all(Val::Px(10.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.5, 0.2)),
+                            ConfirmDialogConfirmButton,
+                        ))
+                        .with_children(|button| {
+                            button.spawn((Text::new("Confirm"), TextColor(Color::WHITE)));
+                        });
+                    });
+            });
+    });
+}
+
+/// Commits or dismisses the pending Tower action: Confirm applies the
+/// Upgrade/Sell (selling despawns the Tower sprite and deselects it),
+/// while Cancel (or clicking the backdrop) simply clears `PendingConfirm`.
+fn handle_confirm_dialog(
+    mut commands: Commands,
+    mut pending: ResMut<PendingConfirm>,
+    mut sim: ResMut<SimState>,
+    mut selected_tower: ResMut<SelectedTower>,
+    confirm: Query<&Interaction, (With<ConfirmDialogConfirmButton>, Changed<Interaction>)>,
+    cancel_or_backdrop: Query<
+        &Interaction,
+        (
+            Or<(With<ConfirmDialogCancelButton>, With<ConfirmDialogBackdrop>)>,
+            Changed<Interaction>,
+        ),
+    >,
+    towers: Query<(Entity, &TowerAt)>,
+) {
+    if pending.0.is_none() {
+        return;
+    }
+
+    let confirmed = confirm
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed);
+    let dismissed = cancel_or_backdrop
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed);
+
+    if confirmed {
+        match pending.0 {
+            Some(ConfirmAction::Upgrade(pos)) => {
+                let _ = sim.0.upgrade_tower(pos);
+            }
+            Some(ConfirmAction::Sell(pos)) => {
+                if sim.0.sell_tower(pos) {
+                    despawn_tower_sprite(&mut commands, &towers, pos);
+                    selected_tower.0 = None;
+                }
+            }
+            None => {}
+        }
+        pending.0 = None;
+    } else if dismissed {
+        pending.0 = None;
     }
 }
