@@ -276,8 +276,10 @@ impl TowerKind {
 
     /// Range at the given Tier. Frost's primary stat, scaled
     /// `TIER_STAT_MULTIPLIER` per Tier over Tier 1; fixed for Cannon
-    /// and Gatling, whose primary stat is damage instead.
-    fn range(self, tier: TowerTier) -> f32 {
+    /// and Gatling, whose primary stat is damage instead. Public so the
+    /// Bevy layer can preview a not-yet-placed Tower's Range ring at
+    /// Tier 1.
+    pub fn range(self, tier: TowerTier) -> f32 {
         match self {
             TowerKind::Cannon => CANNON_RANGE_CELLS,
             TowerKind::Gatling => GATLING_RANGE_CELLS,

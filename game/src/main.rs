@@ -32,6 +32,7 @@ fn main() {
             (
                 select_tower_kind,
                 interact_with_grid,
+                draw_range_rings,
                 handle_tower_panel_buttons,
                 sync_tower_info_panel,
                 handle_wave_button,
@@ -354,12 +355,18 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
 /// buttons to reflect the current selection.
 fn select_tower_kind(
     mut selected: ResMut<SelectedTowerKind>,
+    mut selected_tower: ResMut<SelectedTower>,
     interactions: Query<(&Interaction, &TowerKindButton), Changed<Interaction>>,
     mut buttons: Query<(&TowerKindButton, &mut BackgroundColor)>,
 ) {
     for (interaction, button) in &interactions {
         if *interaction == Interaction::Pressed {
             selected.0 = button.0;
+            // Picking a Kind to place next means the player is done
+            // inspecting whatever Tower was selected — deselect it so
+            // its info panel and Range ring don't linger over the
+            // placement preview.
+            selected_tower.0 = None;
         }
     }
     for (button, mut background) in &mut buttons {
@@ -376,6 +383,21 @@ fn despawn_tower_sprite(commands: &mut Commands, towers: &Query<(Entity, &TowerA
             commands.entity(entity).despawn();
         }
     }
+}
+
+/// Which Cell (if any) the cursor is currently hovering, shared by
+/// `interact_with_grid` (Path preview / placement / selection) and
+/// `draw_range_rings` (placement Range preview) so both apply the same
+/// window/camera → world → Cell conversion.
+fn hovered_cell(
+    windows: &Query<&Window>,
+    camera: &Query<(&Camera, &GlobalTransform)>,
+) -> Option<CellPos> {
+    let window = windows.get_single().ok()?;
+    let cursor = window.cursor_position()?;
+    let (camera, camera_transform) = camera.get_single().ok()?;
+    let world = camera.viewport_to_world_2d(camera_transform, cursor).ok()?;
+    world_to_cell(world)
 }
 
 /// Single seam between mouse input and the `simulation` crate: figures
@@ -402,19 +424,7 @@ fn interact_with_grid(
         return;
     }
 
-    let Ok(window) = windows.get_single() else {
-        return;
-    };
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    let Ok((camera, camera_transform)) = camera.get_single() else {
-        return;
-    };
-    let Ok(world) = camera.viewport_to_world_2d(camera_transform, cursor) else {
-        return;
-    };
-    let Some(hovered) = world_to_cell(world) else {
+    let Some(hovered) = hovered_cell(&windows, &camera) else {
         return;
     };
 
@@ -440,7 +450,16 @@ fn interact_with_grid(
 
     if sim.0.has_tower(hovered) {
         selected_tower.0 = Some(hovered);
-    } else if sim.0.place_tower(hovered, selected.0).is_ok() {
+        return;
+    }
+
+    // Any click on a Cell with no Tower deselects whatever was
+    // previously selected — including a failed placement (e.g. the
+    // Blocking Rule rejected it, or the Cell isn't Buildable) — so a
+    // stray click off a Tower always clears its Range ring instead of
+    // leaving it stuck showing.
+    selected_tower.0 = None;
+    if sim.0.place_tower(hovered, selected.0).is_ok() {
         commands.spawn((
             Sprite {
                 color: tower_color(selected.0),
@@ -450,8 +469,51 @@ fn interact_with_grid(
             Transform::from_translation(cell_world_pos(hovered).with_z(1.0)),
             TowerAt(hovered),
         ));
-        selected_tower.0 = None;
     }
+}
+
+/// Draws a translucent Range ring so the player can see how far a
+/// Tower's Range actually reaches in Cell units, rather than reading a
+/// bare number off the info panel:
+/// - a Tower selected for inspection shows its current (Tiered) Range;
+/// - otherwise, hovering a Buildable Cell previews the selected Tower
+///   Kind's Tier 1 Range for that placement.
+/// Gizmos redraw every frame with no despawn bookkeeping needed, unlike
+/// the Sprite-based overlays elsewhere in this file.
+fn draw_range_rings(
+    mut gizmos: Gizmos,
+    windows: Query<&Window>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    sim: Res<SimState>,
+    selected_tower: Res<SelectedTower>,
+    selected_kind: Res<SelectedTowerKind>,
+) {
+    if let Some(pos) = selected_tower.0 {
+        if let Some(stats) = sim.0.tower_stats_at(pos) {
+            let center = cell_world_pos(pos).truncate();
+            gizmos.circle_2d(center, stats.range * CELL_SIZE_PX, range_ring_color());
+        }
+        return;
+    }
+
+    if sim.0.outcome().is_some() {
+        return;
+    }
+
+    let Some(hovered) = hovered_cell(&windows, &camera) else {
+        return;
+    };
+    if sim.0.has_tower(hovered) || sim.0.grid().kind_at(hovered) != CellKind::Buildable {
+        return;
+    }
+
+    let range = selected_kind.0.range(TowerTier::One);
+    let center = cell_world_pos(hovered).truncate();
+    gizmos.circle_2d(center, range * CELL_SIZE_PX, range_ring_color());
+}
+
+fn range_ring_color() -> Color {
+    Color::srgba(1.0, 1.0, 1.0, 0.55)
 }
 
 /// Handles clicks on the info panel's Upgrade/Sell buttons for
