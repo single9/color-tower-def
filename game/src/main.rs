@@ -36,6 +36,7 @@ fn main() {
                 sync_enemies,
                 sync_projectiles,
                 sync_gold_text,
+                sync_lives_text,
                 sync_wave_ui,
             )
                 .chain(),
@@ -82,6 +83,10 @@ struct ProjectileMarker;
 /// Marks the sidebar's live Gold readout text.
 #[derive(Component)]
 struct GoldText;
+
+/// Marks the sidebar's live Lives readout text.
+#[derive(Component)]
+struct LivesText;
 
 /// Marks the sidebar's live Wave readout text.
 #[derive(Component)]
@@ -226,8 +231,9 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                 GoldText,
             ));
             sidebar.spawn((
-                Text::new("Lives: -"),
+                Text::new(format!("Lives: {}", sim.0.lives())),
                 TextColor(Color::WHITE),
+                LivesText,
             ));
             sidebar.spawn((
                 Text::new(format!("Wave: {}", sim.0.wave_number())),
@@ -591,6 +597,14 @@ fn sync_projectiles(
             ProjectileMarker,
         ));
     }
+}
+
+/// Keeps the sidebar's Lives readout in sync with `simulation` state.
+fn sync_lives_text(sim: Res<SimState>, mut text: Query<&mut Text, With<LivesText>>) {
+    let Ok(mut text) = text.get_single_mut() else {
+        return;
+    };
+    text.0 = format!("Lives: {}", sim.0.lives());
 }
 
 /// Keeps the sidebar's Gold readout in sync with `simulation` state.

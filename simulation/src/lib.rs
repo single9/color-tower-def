@@ -139,6 +139,8 @@ const TIER_STAT_MULTIPLIER: f32 = 1.3;
 
 /// Total Wave count for the MVP (out of scope: anything past Wave 15).
 pub const TOTAL_WAVES: u32 = 15;
+/// Lives the player starts with; a Leak decrements this by 1.
+const STARTING_LIVES: i32 = 20;
 /// Seconds between each Enemy spawning within a Wave.
 const SPAWN_INTERVAL_SECONDS: f32 = 0.8;
 /// Health multiplier applied to every Enemy in Wave `n`: `1 + n * this`.
@@ -303,6 +305,28 @@ pub struct TowerStats {
 pub enum WaveError {
     /// The current Wave's Enemy are still spawning or alive.
     WaveInProgress,
+    /// The game has already ended in Victory or Defeat.
+    GameOver,
+}
+
+/// How the game ended. Once set, `tick` becomes a no-op — Defeat and
+/// Victory both freeze the Simulation exactly where it stood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameOutcome {
+    Victory,
+    Defeat,
+}
+
+/// Something noteworthy `tick` did this call, for the Bevy layer to
+/// react to (play a cue, update the sidebar, show a result screen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimEvent {
+    EnemyKilled(EnemyKind),
+    /// An Enemy reached the Goal; Lives decremented by 1.
+    Leak,
+    WaveCleared(u32),
+    Victory,
+    Defeat,
 }
 
 /// The Enemy Kind cycled through to build a Wave's spawn queue:
@@ -404,6 +428,10 @@ pub struct Simulation {
     /// Counts down to the next spawn; an Enemy spawns whenever this
     /// reaches zero and the queue isn't empty, then resets.
     spawn_timer: f32,
+    lives: i32,
+    /// Set the instant Defeat or Victory triggers; once set, `tick`
+    /// no-ops forever after, freezing the Simulation in place.
+    outcome: Option<GameOutcome>,
 }
 
 impl Simulation {
@@ -419,7 +447,17 @@ impl Simulation {
             wave_in_progress: false,
             spawn_queue: VecDeque::new(),
             spawn_timer: 0.0,
+            lives: STARTING_LIVES,
+            outcome: None,
         }
+    }
+
+    pub fn lives(&self) -> i32 {
+        self.lives
+    }
+
+    pub fn outcome(&self) -> Option<GameOutcome> {
+        self.outcome
     }
 
     pub fn grid(&self) -> &Grid {
@@ -585,6 +623,9 @@ impl Simulation {
     /// Rejected while the current Wave is still spawning or has any
     /// Enemy alive.
     pub fn start_next_wave(&mut self) -> Result<(), WaveError> {
+        if self.outcome.is_some() {
+            return Err(WaveError::GameOver);
+        }
         if self.wave_in_progress {
             return Err(WaveError::WaveInProgress);
         }
@@ -647,13 +688,28 @@ impl Simulation {
     /// Advances the whole Simulation by `dt` seconds: Wave spawning,
     /// then Enemy movement (at whatever speed the current Frost
     /// coverage allows), then Tower firing, then Projectile
-    /// flight/impact, then Wave-completion bookkeeping.
-    pub fn tick(&mut self, dt: f32) {
+    /// flight/impact, then Wave-completion bookkeeping. Returns every
+    /// noteworthy `SimEvent` this call produced, in order. A no-op
+    /// once `outcome()` is set — Defeat and Victory both freeze the
+    /// Simulation exactly where it stood.
+    pub fn tick(&mut self, dt: f32) -> Vec<SimEvent> {
+        if self.outcome.is_some() {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
         self.tick_spawning(dt);
-        self.tick_enemies_movement(dt);
+        events.extend(self.tick_enemies_movement(dt));
+        if self.outcome.is_some() {
+            // Defeat overrides everything else in progress this tick:
+            // don't let Towers/Projectiles/Wave-completion act on a
+            // board that no longer matters.
+            return events;
+        }
         self.tick_towers(dt);
-        self.tick_projectiles(dt);
-        self.tick_wave_completion();
+        events.extend(self.tick_projectiles(dt));
+        events.extend(self.tick_wave_completion());
+        events
     }
 
     /// Dequeues Enemy from the in-progress Wave's `spawn_queue` one at
@@ -675,12 +731,25 @@ impl Simulation {
     }
 
     /// A Wave is complete once every Enemy has been spawned and none
-    /// remain alive; advances to the next Wave number when so.
-    fn tick_wave_completion(&mut self) {
-        if self.wave_in_progress && self.spawn_queue.is_empty() && self.enemies.is_empty() {
-            self.wave_in_progress = false;
+    /// remain alive. Advances to the next Wave number, unless the
+    /// just-cleared Wave was the last (`TOTAL_WAVES`), in which case
+    /// Victory triggers instead (this only runs when `tick` hasn't
+    /// already set Defeat, so Lives > 0 is implied).
+    fn tick_wave_completion(&mut self) -> Vec<SimEvent> {
+        if !(self.wave_in_progress && self.spawn_queue.is_empty() && self.enemies.is_empty()) {
+            return Vec::new();
+        }
+
+        self.wave_in_progress = false;
+        let cleared_wave = self.wave_number;
+        let mut events = vec![SimEvent::WaveCleared(cleared_wave)];
+        if cleared_wave >= TOTAL_WAVES {
+            self.outcome = Some(GameOutcome::Victory);
+            events.push(SimEvent::Victory);
+        } else {
             self.wave_number += 1;
         }
+        events
     }
 
     /// Whether `enemy_pos` falls within any Frost Tower's Range right
@@ -703,9 +772,13 @@ impl Simulation {
     /// times its own current Frost slow multiplier. Per ADR-0002, an
     /// Enemy's Path is only ever recomputed the instant it reaches a
     /// Cell center — never mid-transit, no matter how the Grid changes
-    /// underneath it in the meantime. An Enemy that reaches Goal
-    /// leaks (despawns here; Lives/Leak bookkeeping lands in ticket 09).
-    fn tick_enemies_movement(&mut self, dt: f32) {
+    /// underneath it in the meantime. An Enemy that reaches Goal leaks:
+    /// it despawns and Lives decrements by 1. The instant Lives
+    /// reaches 0, Defeat triggers and this stops processing any
+    /// remaining Enemy immediately — Defeat overrides everything else
+    /// in progress.
+    fn tick_enemies_movement(&mut self, dt: f32) -> Vec<SimEvent> {
+        let mut events = Vec::new();
         let goal = self.grid.goal();
         let mut i = 0;
         while i < self.enemies.len() {
@@ -733,6 +806,13 @@ impl Simulation {
 
             if target == goal {
                 self.enemies.remove(i);
+                self.lives -= 1;
+                events.push(SimEvent::Leak);
+                if self.lives <= 0 {
+                    self.outcome = Some(GameOutcome::Defeat);
+                    events.push(SimEvent::Defeat);
+                    return events;
+                }
                 continue;
             }
 
@@ -745,6 +825,7 @@ impl Simulation {
             enemy.target = new_target;
             i += 1;
         }
+        events
     }
 
     /// Ticks down every projectile-firing Tower's cooldown and fires a
@@ -793,10 +874,11 @@ impl Simulation {
     /// Projectile whose target has died — from this hit or an earlier
     /// one this same tick, or from anything else — despawns without
     /// effect on any other Enemy.
-    fn tick_projectiles(&mut self, dt: f32) {
+    fn tick_projectiles(&mut self, dt: f32) -> Vec<SimEvent> {
         let in_flight = std::mem::take(&mut self.projectiles);
         let mut remaining = Vec::with_capacity(in_flight.len());
         let mut gold_earned = 0;
+        let mut events = Vec::new();
 
         for mut projectile in in_flight {
             let Some(target_index) = self.enemies.iter().position(|e| e.id == projectile.target_id)
@@ -810,6 +892,7 @@ impl Simulation {
                 enemy.health -= projectile.damage;
                 if enemy.health <= 0.0 {
                     gold_earned += enemy.kind.gold_reward();
+                    events.push(SimEvent::EnemyKilled(enemy.kind));
                     self.enemies.remove(target_index);
                 }
                 continue;
@@ -827,6 +910,7 @@ impl Simulation {
         }
         self.projectiles = remaining;
         self.gold += gold_earned;
+        events
     }
 
     /// BFS from `from` to Goal, treating every placed Tower — plus
@@ -1344,11 +1428,17 @@ mod tests {
             assert_eq!(sim.enemy_health(), Some(expected_health));
 
             // Force this Wave to completion so the next assertion
-            // starts from a clean, un-in-progress state.
+            // starts from a clean, un-in-progress state. Wave
+            // TOTAL_WAVES's clear triggers Victory instead of
+            // advancing wave_number further.
             sim.spawn_queue.clear();
             sim.enemies.clear();
             sim.tick(0.001);
-            assert_eq!(sim.wave_number(), n + 1);
+            if n >= TOTAL_WAVES {
+                assert_eq!(sim.outcome(), Some(GameOutcome::Victory));
+            } else {
+                assert_eq!(sim.wave_number(), n + 1);
+            }
         }
 
         let mut sim = Simulation::new();
@@ -1382,5 +1472,95 @@ mod tests {
         // is still alive.
         sim.spawn_queue.clear();
         assert_eq!(sim.start_next_wave(), Err(WaveError::WaveInProgress));
+    }
+
+    #[test]
+    fn a_leak_decrements_lives_and_emits_a_leak_event() {
+        let mut sim = Simulation::new();
+        sim.spawn_enemy(EnemyKind::Grunt);
+        let lives_before = sim.lives();
+
+        let steps_to_goal = sim.grid().goal().x - sim.grid().spawn().x;
+        let mut saw_leak = false;
+        for _ in 0..steps_to_goal {
+            let events = sim.tick(1.0 / EnemyKind::Grunt.speed());
+            if events.contains(&SimEvent::Leak) {
+                saw_leak = true;
+            }
+        }
+
+        assert!(saw_leak, "walking an Enemy to Goal should emit a Leak event");
+        assert_eq!(sim.lives(), lives_before - 1);
+        assert!(!sim.enemy_alive());
+    }
+
+    #[test]
+    fn lives_hitting_zero_emits_defeat_immediately_regardless_of_remaining_enemy() {
+        let mut sim = Simulation::new();
+        sim.lives = 1;
+        // Grunt (faster) leaks first and should zero Lives before the
+        // still-alive, slower Tank ever gets processed this tick.
+        sim.spawn_enemy(EnemyKind::Grunt);
+        sim.spawn_enemy(EnemyKind::Tank);
+
+        let steps_to_goal = sim.grid().goal().x - sim.grid().spawn().x;
+        let mut saw_defeat = false;
+        for _ in 0..steps_to_goal {
+            let events = sim.tick(1.0 / EnemyKind::Grunt.speed());
+            if events.contains(&SimEvent::Defeat) {
+                saw_defeat = true;
+                break;
+            }
+        }
+
+        assert!(saw_defeat, "Lives reaching 0 should emit Defeat");
+        assert_eq!(sim.outcome(), Some(GameOutcome::Defeat));
+        assert_eq!(sim.lives(), 0);
+        assert!(
+            sim.enemy_alive(),
+            "Defeat should override processing the remaining Tank this tick, leaving it untouched"
+        );
+
+        // Once Defeat has triggered, further ticks are pure no-ops.
+        let events = sim.tick(1.0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn wave_fifteen_clear_with_lives_above_zero_emits_victory() {
+        let mut sim = Simulation::new();
+        while sim.wave_number() < TOTAL_WAVES {
+            sim.start_next_wave().unwrap();
+            sim.spawn_queue.clear();
+            sim.enemies.clear();
+            sim.tick(0.001);
+        }
+        assert_eq!(sim.wave_number(), TOTAL_WAVES);
+        assert!(sim.lives() > 0);
+
+        sim.start_next_wave().unwrap();
+        sim.spawn_queue.clear();
+        sim.enemies.clear();
+        let events = sim.tick(0.001);
+
+        assert!(events.contains(&SimEvent::Victory));
+        assert_eq!(sim.outcome(), Some(GameOutcome::Victory));
+    }
+
+    #[test]
+    fn a_non_final_wave_clear_emits_neither_victory_nor_defeat() {
+        let mut sim = Simulation::new();
+        sim.start_next_wave().unwrap();
+        sim.spawn_queue.clear();
+        sim.enemies.clear();
+
+        let events = sim.tick(0.001);
+
+        assert!(events.contains(&SimEvent::WaveCleared(1)));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, SimEvent::Victory | SimEvent::Defeat)));
+        assert_eq!(sim.outcome(), None);
+        assert_eq!(sim.wave_number(), 2);
     }
 }
