@@ -4,9 +4,13 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Running the app opens a 700x500 window
-- [ ] The left 500x500 area renders a 25x25 grid of 20px Cell
-- [ ] Exactly one Cell is rendered as Spawn (dark purple) and one as Goal (orange); all other Cell render as Buildable (light gray)
-- [ ] The right 200px area renders a visually separated sidebar panel
+- [x] Running the app opens a 700x500 window
+- [x] The left 500x500 area renders a 25x25 grid of 20px Cell
+- [x] Exactly one Cell is rendered as Spawn (dark purple) and one as Goal (orange); all other Cell render as Buildable (light gray)
+- [x] The right 200px area renders a visually separated sidebar panel
+
+## Verification
+
+Confirmed visually via a self-screenshot taken from inside the running Bevy app (avoids any risk of capturing unrelated desktop content).

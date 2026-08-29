@@ -1,6 +1,6 @@
 use bevy::color::palettes::css;
 use bevy::prelude::*;
-use simulation::{CellKind, CellPos, Grid, CELL_SIZE_PX, GRID_SIZE};
+use simulation::{CellKind, CellPos, Grid, Simulation, CELL_SIZE_PX, GRID_SIZE};
 
 const GRID_PX: f32 = CELL_SIZE_PX * GRID_SIZE as f32; // 500.0
 const SIDEBAR_PX: f32 = 200.0;
@@ -18,9 +18,26 @@ fn main() {
             }),
             ..default()
         }))
+        .insert_resource(SimState(Simulation::new()))
         .add_systems(Startup, (spawn_camera, spawn_grid, spawn_sidebar))
+        .add_systems(Update, interact_with_grid)
         .run();
 }
+
+/// The Bevy-independent game rules, owned as a resource. This is the
+/// one seam the Bevy layer talks to for all placement/Path logic.
+#[derive(Resource)]
+struct SimState(Simulation);
+
+/// Marks the Tower sprite placed at a given Cell, so it can be found
+/// again on sell.
+#[derive(Component)]
+struct TowerAt(CellPos);
+
+/// Marks a translucent Path-preview overlay tile, so all of them can
+/// be cleared before redrawing each frame.
+#[derive(Component)]
+struct PathPreviewTile;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -35,6 +52,31 @@ fn cell_world_pos(pos: CellPos) -> Vec3 {
     let x = left_edge + pos.x as f32 * CELL_SIZE_PX + CELL_SIZE_PX / 2.0;
     let y = bottom_edge + pos.y as f32 * CELL_SIZE_PX + CELL_SIZE_PX / 2.0;
     Vec3::new(x, y, 0.0)
+}
+
+/// Inverse of `cell_world_pos`: which Cell (if any) a world position
+/// falls inside. Returns `None` for anything outside the Grid's
+/// GRID_PX x GRID_PX square (e.g. the sidebar).
+fn world_to_cell(world: Vec2) -> Option<CellPos> {
+    let left_edge = -WINDOW_WIDTH / 2.0;
+    let bottom_edge = -WINDOW_HEIGHT / 2.0;
+    let rel_x = world.x - left_edge;
+    let rel_y = world.y - bottom_edge;
+    if rel_x < 0.0 || rel_y < 0.0 || rel_x >= GRID_PX || rel_y >= GRID_PX {
+        return None;
+    }
+    Some(CellPos::new(
+        (rel_x / CELL_SIZE_PX) as usize,
+        (rel_y / CELL_SIZE_PX) as usize,
+    ))
+}
+
+fn tower_color() -> Color {
+    Color::Srgba(css::RED) // Cannon; other Tower Kind land in ticket 05
+}
+
+fn path_preview_color() -> Color {
+    Color::srgba(1.0, 1.0, 0.0, 0.35) // translucent yellow
 }
 
 fn cell_color(kind: CellKind) -> Color {
@@ -108,4 +150,77 @@ fn spawn_sidebar(mut commands: Commands) {
                     });
             }
         });
+}
+
+/// Single seam between mouse input and the `simulation` crate: figures
+/// out which Cell the cursor is over, redraws the Path preview for it,
+/// and on a left click either sells an existing Tower or places a new
+/// one (subject to the Blocking Rule enforced entirely inside `sim`).
+fn interact_with_grid(
+    mut commands: Commands,
+    windows: Query<&Window>,
+    camera: Query<(&Camera, &GlobalTransform)>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut sim: ResMut<SimState>,
+    towers: Query<(Entity, &TowerAt)>,
+    preview_tiles: Query<Entity, With<PathPreviewTile>>,
+) {
+    for entity in &preview_tiles {
+        commands.entity(entity).despawn();
+    }
+
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((camera, camera_transform)) = camera.get_single() else {
+        return;
+    };
+    let Ok(world) = camera.viewport_to_world_2d(camera_transform, cursor) else {
+        return;
+    };
+    let Some(hovered) = world_to_cell(world) else {
+        return;
+    };
+
+    if !sim.0.has_tower(hovered) && sim.0.grid().kind_at(hovered) == CellKind::Buildable {
+        if let Some(path) = sim.0.preview_path_if_placed(hovered) {
+            for pos in path {
+                commands.spawn((
+                    Sprite {
+                        color: path_preview_color(),
+                        custom_size: Some(Vec2::splat(CELL_SIZE_PX - 1.0)),
+                        ..default()
+                    },
+                    Transform::from_translation(cell_world_pos(pos).with_z(0.5)),
+                    PathPreviewTile,
+                ));
+            }
+        }
+    }
+
+    if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    if sim.0.has_tower(hovered) {
+        sim.0.sell_tower(hovered);
+        for (entity, tower_at) in &towers {
+            if tower_at.0 == hovered {
+                commands.entity(entity).despawn();
+            }
+        }
+    } else if sim.0.place_tower(hovered).is_ok() {
+        commands.spawn((
+            Sprite {
+                color: tower_color(),
+                custom_size: Some(Vec2::splat(CELL_SIZE_PX - 1.0)),
+                ..default()
+            },
+            Transform::from_translation(cell_world_pos(hovered).with_z(1.0)),
+            TowerAt(hovered),
+        ));
+    }
 }

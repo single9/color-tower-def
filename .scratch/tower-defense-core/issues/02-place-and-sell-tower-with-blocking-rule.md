@@ -4,10 +4,15 @@
 
 **Blocked by:** 01 (Grid renders)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Clicking a Buildable Cell places a Tower there and the Cell renders in the Tower's color (red, for Cannon)
-- [ ] Hovering/selecting a Buildable Cell before confirming shows the resulting Path as a translucent yellow overlay
-- [ ] Attempting to place a Tower that would leave no Path from Spawn to Goal is rejected — no Tower is placed, the Cell remains Buildable
-- [ ] Clicking a Cell that already has a Tower removes it, reverting the Cell to Buildable
-- [ ] `simulation` module unit tests cover: valid placement succeeds, placement that would fully seal the maze is rejected, placement that leaves any path (however narrow) succeeds, sell removes the Tower and frees the Cell
+- [x] Clicking a Buildable Cell places a Tower there and the Cell renders in the Tower's color (red, for Cannon)
+- [x] Hovering/selecting a Buildable Cell before confirming shows the resulting Path as a translucent yellow overlay
+- [x] Attempting to place a Tower that would leave no Path from Spawn to Goal is rejected — no Tower is placed, the Cell remains Buildable
+- [x] Clicking a Cell that already has a Tower removes it, reverting the Cell to Buildable
+- [x] `simulation` module unit tests cover: valid placement succeeds, placement that would fully seal the maze is rejected, placement that leaves any path (however narrow) succeeds, sell removes the Tower and frees the Cell
+
+## Verification
+
+- `cargo test --workspace`: 8/8 `simulation` unit tests pass, covering the Blocking Rule (full-seal rejection + narrow-gap success), duplicate/Spawn/Goal placement rejection, and sell freeing the Cell.
+- Manually driven via synthetic X11 input against the running Bevy window (screenshots inspected): hover shows the yellow Path preview, a click places a red Tower, clicking it again sells it, and attempting to enclose Spawn's third and last open neighbor is silently rejected (Cell stays Buildable) while the first two succeed.
