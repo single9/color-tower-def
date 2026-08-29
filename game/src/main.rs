@@ -1,4 +1,6 @@
 use bevy::color::palettes::css;
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::ButtonState;
 use bevy::prelude::*;
 use simulation::{
     CellKind, CellPos, EnemyKind, GameOutcome, Simulation, TowerKind, TowerTier, CELL_SIZE_PX, GRID_SIZE,
@@ -23,9 +25,16 @@ fn main() {
         .insert_resource(SimState(Simulation::new()))
         .insert_resource(SelectedTowerKind(TowerKind::Cannon))
         .insert_resource(SelectedTower(None))
+        .insert_resource(CommandPalette::default())
         .add_systems(
             Startup,
-            (spawn_camera, spawn_grid, spawn_sidebar, spawn_result_overlay),
+            (
+                spawn_camera,
+                spawn_grid,
+                spawn_sidebar,
+                spawn_result_overlay,
+                spawn_command_palette,
+            ),
         )
         .add_systems(
             Update,
@@ -37,6 +46,9 @@ fn main() {
                 sync_tower_info_panel,
                 handle_wave_button,
                 handle_reset_button,
+                toggle_command_palette,
+                type_into_command_palette,
+                sync_command_palette_ui,
                 tick_simulation,
                 sync_enemies,
                 sync_projectiles,
@@ -141,6 +153,31 @@ struct ResultOverlayRoot;
 /// The result overlay's "Reset" button.
 #[derive(Component)]
 struct ResetButton;
+
+/// State for the dev-only Command Palette (toggled with the Backquote
+/// key): whether it's open, the in-progress input line, and the
+/// result/help line shown under it. A debugging/playtesting aid for
+/// reaching later Level/Wave/Gold states without grinding — see
+/// `run_command` for the supported commands.
+#[derive(Resource, Default)]
+struct CommandPalette {
+    open: bool,
+    input: String,
+    message: Option<String>,
+}
+
+/// The Command Palette's root Node, toggled between `Visibility::Visible`
+/// and `Visibility::Hidden` to show/hide the whole bar.
+#[derive(Component)]
+struct CommandPaletteRoot;
+
+/// The Command Palette's input line (`"> {input}_"`).
+#[derive(Component)]
+struct CommandPaletteInputText;
+
+/// The Command Palette's help/result line, shown under the input line.
+#[derive(Component)]
+struct CommandPaletteMessageText;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -652,8 +689,23 @@ fn sync_tower_info_panel(
 /// Kept separate from rendering so `sync_enemies`/`sync_projectiles`
 /// read post-tick state, mirroring how `sync_projectiles` already
 /// depended on `move_enemy` ticking first in earlier tickets.
-fn tick_simulation(time: Res<Time>, mut sim: ResMut<SimState>) {
-    sim.0.tick(time.delta_secs());
+fn tick_simulation(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut sim: ResMut<SimState>,
+    towers: Query<Entity, With<TowerAt>>,
+) {
+    let events = sim.0.tick(time.delta_secs());
+    // A LevelCleared Wave-completion sells every placed Tower inside
+    // `sim` (see SimEvent::LevelCleared) for the new Level's Grid, but
+    // has no way to reach into Bevy to despawn the Sprites those Tower
+    // used to have — do that here, the same way `run_command`'s `level`
+    // Command Palette command and `handle_reset_button` already do.
+    if events.iter().any(|event| matches!(event, simulation::SimEvent::LevelCleared(_))) {
+        for entity in &towers {
+            commands.entity(entity).despawn();
+        }
+    }
 }
 
 /// Redraws every live Enemy from `simulation` state, mirroring the
@@ -891,5 +943,169 @@ fn handle_reset_button(
                 commands.entity(entity).despawn();
             }
         }
+    }
+}
+
+/// Spawns the dev-only Command Palette bar, hidden by default, docked
+/// across the bottom of the whole window (Grid and sidebar both) so it
+/// never fights the sidebar's own layout.
+fn spawn_command_palette(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(2.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
+            Visibility::Hidden,
+            CommandPaletteRoot,
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("> "),
+                TextColor(Color::WHITE),
+                CommandPaletteInputText,
+            ));
+            panel.spawn((
+                Text::new(command_palette_help()),
+                TextColor(Color::srgb(0.6, 0.6, 0.65)),
+                CommandPaletteMessageText,
+            ));
+        });
+}
+
+fn command_palette_help() -> String {
+    format!(
+        "level <1..{}> | gold <amount> | skipwave  (Enter to run, Esc to close)",
+        simulation::LEVEL_COUNT
+    )
+}
+
+/// Opens/closes the Command Palette on Backquote (the `` ` `` /`~` key),
+/// clearing any leftover input/result each time it opens.
+fn toggle_command_palette(keys: Res<ButtonInput<KeyCode>>, mut palette: ResMut<CommandPalette>) {
+    if keys.just_pressed(KeyCode::Backquote) {
+        palette.open = !palette.open;
+        palette.input.clear();
+        palette.message = None;
+    }
+}
+
+/// While the Command Palette is open, feeds raw `KeyboardInput` events
+/// into its input line (Backspace to edit, Escape to close) and runs
+/// the line through `run_command` on Enter. Ignored entirely while
+/// closed — including the very Backquote-press event that just opened
+/// or closed it, via the `key_code` check below, so that keystroke
+/// never leaks into the input line.
+fn type_into_command_palette(
+    mut commands: Commands,
+    mut key_events: EventReader<KeyboardInput>,
+    mut palette: ResMut<CommandPalette>,
+    mut sim: ResMut<SimState>,
+    towers: Query<Entity, With<TowerAt>>,
+) {
+    if !palette.open {
+        key_events.clear();
+        return;
+    }
+
+    for event in key_events.read() {
+        if event.state != ButtonState::Pressed || event.key_code == KeyCode::Backquote {
+            continue;
+        }
+        match &event.logical_key {
+            Key::Character(text) => palette.input.push_str(text),
+            // `Key::Space` is a separate variant from `Key::Character`,
+            // not text " " — without this arm Space silently falls
+            // through to the catch-all below and never reaches the
+            // input line.
+            Key::Space => palette.input.push(' '),
+            Key::Backspace => {
+                palette.input.pop();
+            }
+            Key::Enter => {
+                let command = std::mem::take(&mut palette.input);
+                palette.message = Some(run_command(&mut commands, &mut sim.0, &towers, command.trim()));
+            }
+            Key::Escape => palette.open = false,
+            _ => {}
+        }
+    }
+}
+
+/// Parses and runs one Command Palette line, returning the result/error
+/// text to show under the input line. Every command here is a dev-only
+/// shortcut for playtesting — none of it is reachable through normal
+/// play.
+fn run_command(
+    commands: &mut Commands,
+    sim: &mut Simulation,
+    towers: &Query<Entity, With<TowerAt>>,
+    command: &str,
+) -> String {
+    let mut parts = command.split_whitespace();
+    match parts.next() {
+        Some("level") => match parts.next().and_then(|arg| arg.parse::<usize>().ok()) {
+            Some(n) if (1..=simulation::LEVEL_COUNT).contains(&n) => {
+                sim.debug_set_level(n - 1);
+                // The Tower sprites the Bevy layer spawned no longer
+                // correspond to anything in `sim` once its Grid
+                // changes underneath them.
+                for entity in towers {
+                    commands.entity(entity).despawn();
+                }
+                format!("Jumped to Level {n}/{}", simulation::LEVEL_COUNT)
+            }
+            _ => format!("Usage: level <1..{}>", simulation::LEVEL_COUNT),
+        },
+        Some("gold") => match parts.next().and_then(|arg| arg.parse::<i32>().ok()) {
+            Some(amount) => {
+                sim.debug_add_gold(amount);
+                format!("+{amount} Gold (now {})", sim.gold())
+            }
+            None => "Usage: gold <amount>".to_string(),
+        },
+        Some("skipwave") => {
+            sim.debug_skip_wave();
+            "Wave skipped".to_string()
+        }
+        Some(other) => format!("Unknown command: {other}"),
+        None => String::new(),
+    }
+}
+
+/// Keeps the Command Palette's visibility and text in sync with
+/// `CommandPalette`: shows/hides the whole bar, and while open, mirrors
+/// the in-progress input line and the last result (or the help text,
+/// before anything's been run yet).
+fn sync_command_palette_ui(
+    palette: Res<CommandPalette>,
+    mut root: Query<&mut Visibility, With<CommandPaletteRoot>>,
+    mut input_text: Query<&mut Text, (With<CommandPaletteInputText>, Without<CommandPaletteMessageText>)>,
+    mut message_text: Query<&mut Text, (With<CommandPaletteMessageText>, Without<CommandPaletteInputText>)>,
+) {
+    let Ok(mut visibility) = root.get_single_mut() else {
+        return;
+    };
+    *visibility = if palette.open {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    if !palette.open {
+        return;
+    }
+
+    if let Ok(mut text) = input_text.get_single_mut() {
+        text.0 = format!("> {}_", palette.input);
+    }
+    if let Ok(mut text) = message_text.get_single_mut() {
+        text.0 = palette.message.clone().unwrap_or_else(command_palette_help);
     }
 }

@@ -744,6 +744,55 @@ impl Simulation {
         kind.health() * (1.0 + self.wave_number as f32 * WAVE_HEALTH_SCALING_PER_WAVE)
     }
 
+    /// Dev-only: jumps straight to `level` (clamped to
+    /// `LEVEL_COUNT - 1`), mirroring the natural Level-clear transition
+    /// (see ADR-0003) — refunds every placed Tower at the usual Sell
+    /// rate, regenerates the Grid, and resets Wave to 1 — but skips
+    /// actually having to clear every Wave first, and (unlike the
+    /// natural transition) also clears any Wave in progress since it
+    /// can be called mid-Wave. Exists for the game layer's dev command
+    /// palette so later Levels can be playtested directly.
+    pub fn debug_set_level(&mut self, level: usize) {
+        let level = level.min(LEVEL_COUNT - 1);
+        let refund: i32 = self
+            .towers
+            .values()
+            .map(|runtime| (runtime.gold_spent as f32 * SELL_REFUND_FRACTION).round() as i32)
+            .sum();
+        self.gold += refund;
+        self.towers.clear();
+        self.level = level;
+        self.grid = Grid::for_level(self.level);
+        self.wave_number = 1;
+        self.wave_in_progress = false;
+        self.spawn_queue.clear();
+        self.spawn_timer = 0.0;
+        self.enemies.clear();
+    }
+
+    /// Dev-only: grants `amount` Gold outright, for the command
+    /// palette's `gold` command — a shortcut around grinding Waves to
+    /// afford a specific Tower layout while playtesting.
+    pub fn debug_add_gold(&mut self, amount: i32) {
+        self.gold += amount;
+    }
+
+    /// Dev-only: instantly clears the Wave in progress — despawns
+    /// every live Enemy (no Gold reward, unlike a real kill) and drops
+    /// the rest of the spawn queue — so the very next `tick` sees an
+    /// empty queue and no Enemy left and completes the Wave through
+    /// the usual `tick_wave_completion` path (advancing the Wave
+    /// number, or the Level/Victory on the last Wave). A no-op if no
+    /// Wave is in progress. For the command palette's `skipwave`
+    /// command.
+    pub fn debug_skip_wave(&mut self) {
+        if !self.wave_in_progress {
+            return;
+        }
+        self.spawn_queue.clear();
+        self.enemies.clear();
+    }
+
     pub fn enemy_alive(&self) -> bool {
         !self.enemies.is_empty()
     }
