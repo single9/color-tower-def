@@ -22,21 +22,74 @@ pub enum CellKind {
     Buildable,
     Spawn,
     Goal,
+    /// A permanent, un-buildable, un-sellable wall baked into the
+    /// current Level's map — distinct from a player-placed Tower.
+    Obstacle,
+}
+
+/// The fixed layout for one Level: Spawn/Goal position plus every
+/// permanently-blocked Cell (map walls, not player Towers). Every
+/// Level shares the same Spawn/Goal so the Wave/Gold/Lives economy
+/// carries over unchanged; only the maze of Obstacle differs.
+struct LevelConfig {
+    spawn: CellPos,
+    goal: CellPos,
+    obstacles: Vec<CellPos>,
+}
+
+/// How many Level the game cycles through before a Victory. Clearing
+/// `TOTAL_WAVES` on any but the last Level advances to the next
+/// Level's map instead of ending the game (see
+/// `Simulation::tick_wave_completion`).
+pub const LEVEL_COUNT: usize = 3;
+
+/// Builds Level `level`'s fixed layout (clamped to the last Level for
+/// any out-of-range index). Each entry beyond Level 0 (the original
+/// monotonous straight-line map) adds full-column walls with a single
+/// gap, alternating the gap between near the top and near the bottom
+/// row so the Path zigzags instead of running straight across —
+/// mirroring the single-gap-stays-valid Blocking Rule guarantee
+/// already proven by `sealing_the_entire_maze_is_rejected...`.
+fn level_config(level: usize) -> LevelConfig {
+    let spawn = CellPos::new(0, GRID_SIZE / 2);
+    let goal = CellPos::new(GRID_SIZE - 1, GRID_SIZE / 2);
+    let walls: &[(usize, usize)] = match level.min(LEVEL_COUNT - 1) {
+        0 => &[],
+        1 => &[(8, 3), (16, GRID_SIZE - 4)],
+        _ => &[(6, 3), (12, GRID_SIZE - 4), (18, 3)],
+    };
+    let obstacles = walls
+        .iter()
+        .flat_map(|&(x, gap_y)| (0..GRID_SIZE).filter(move |&y| y != gap_y).map(move |y| CellPos::new(x, y)))
+        .collect();
+    LevelConfig { spawn, goal, obstacles }
 }
 
 #[derive(Debug, Clone)]
 pub struct Grid {
     spawn: CellPos,
     goal: CellPos,
+    obstacles: HashSet<CellPos>,
 }
 
 impl Grid {
-    /// A single fixed 25x25 map: one Spawn Cell on the left edge, one
-    /// Goal Cell on the right edge, everything else Buildable.
+    /// Level 0's fixed 25x25 map: one Spawn Cell on the left edge, one
+    /// Goal Cell on the right edge, everything else Buildable — the
+    /// original straight-line layout, kept as the default/no-arg
+    /// constructor for backward compatibility.
     pub fn new() -> Self {
+        Self::for_level(0)
+    }
+
+    /// Builds the fixed map for Level `level` (clamped to the last
+    /// Level for any out-of-range index): same Spawn/Goal as every
+    /// other Level, plus that Level's permanent Obstacle walls.
+    fn for_level(level: usize) -> Self {
+        let config = level_config(level);
         Self {
-            spawn: CellPos::new(0, GRID_SIZE / 2),
-            goal: CellPos::new(GRID_SIZE - 1, GRID_SIZE / 2),
+            spawn: config.spawn,
+            goal: config.goal,
+            obstacles: config.obstacles.into_iter().collect(),
         }
     }
 
@@ -53,9 +106,15 @@ impl Grid {
             CellKind::Spawn
         } else if pos == self.goal {
             CellKind::Goal
+        } else if self.obstacles.contains(&pos) {
+            CellKind::Obstacle
         } else {
             CellKind::Buildable
         }
+    }
+
+    fn is_obstacle(&self, pos: CellPos) -> bool {
+        self.obstacles.contains(&pos)
     }
 
     pub fn cells(&self) -> impl Iterator<Item = CellPos> {
@@ -329,6 +388,11 @@ pub enum SimEvent {
     /// An Enemy reached the Goal; Lives decremented by 1.
     Leak,
     WaveCleared(u32),
+    /// Clearing `TOTAL_WAVES` on a non-final Level (the `u32` is the
+    /// Level just cleared, 1-indexed) advanced to the next Level's
+    /// map instead of ending the game: Gold/Lives carry over, every
+    /// placed Tower is sold at the usual refund, and Wave resets to 1.
+    LevelCleared(u32),
     Victory,
     Defeat,
 }
@@ -424,6 +488,8 @@ pub struct Simulation {
     next_enemy_id: u32,
     projectiles: Vec<Projectile>,
     gold: i32,
+    /// The current Level, 0-indexed — see `LEVEL_COUNT`/`level_config`.
+    level: usize,
     /// The Wave about to start (or currently in progress), 1-indexed.
     wave_number: u32,
     wave_in_progress: bool,
@@ -440,13 +506,24 @@ pub struct Simulation {
 
 impl Simulation {
     pub fn new() -> Self {
+        Self::new_at_level(0)
+    }
+
+    /// Starts a fresh game on Level `level` (0-indexed, clamped to the
+    /// last Level for any out-of-range index) instead of always
+    /// Level 0. Exists mainly as an authoring/testing seam for the
+    /// last-Level Victory condition; real gameplay always starts at
+    /// Level 0 via `new` and advances through `tick_wave_completion`.
+    fn new_at_level(level: usize) -> Self {
+        let level = level.min(LEVEL_COUNT - 1);
         Self {
-            grid: Grid::new(),
+            grid: Grid::for_level(level),
             towers: HashMap::new(),
             enemies: Vec::new(),
             next_enemy_id: 0,
             projectiles: Vec::new(),
             gold: STARTING_GOLD,
+            level,
             wave_number: 1,
             wave_in_progress: false,
             spawn_queue: VecDeque::new(),
@@ -454,6 +531,12 @@ impl Simulation {
             lives: STARTING_LIVES,
             outcome: None,
         }
+    }
+
+    /// The current Level, 1-indexed, for the Bevy layer's sidebar
+    /// (`level` itself is stored 0-indexed internally).
+    pub fn level_number(&self) -> u32 {
+        self.level as u32 + 1
     }
 
     pub fn lives(&self) -> i32 {
@@ -692,10 +775,16 @@ impl Simulation {
         }
     }
 
-    /// Every live Enemy's Kind and current transit segment, for the
-    /// Bevy layer to render each one.
-    pub fn enemies_transits(&self) -> impl Iterator<Item = (EnemyKind, EnemyTransit)> + '_ {
-        self.enemies.iter().map(|e| (e.kind, Self::transit_of(e)))
+    /// Every live Enemy's stable id, Kind, and current transit
+    /// segment, for the Bevy layer to render each one. The id lets
+    /// the Bevy layer give each Enemy a consistent draw-order/z-depth
+    /// across frames even though its sprite is despawned and
+    /// respawned fresh every frame — without it, two Enemy occupying
+    /// the same on-screen position have no stable tie-break and
+    /// visibly flicker as which one draws on top changes frame to
+    /// frame.
+    pub fn enemies_transits(&self) -> impl Iterator<Item = (u32, EnemyKind, EnemyTransit)> + '_ {
+        self.enemies.iter().map(|e| (e.id, e.kind, Self::transit_of(e)))
     }
 
     /// Advances the whole Simulation by `dt` seconds: Wave spawning,
@@ -745,9 +834,14 @@ impl Simulation {
 
     /// A Wave is complete once every Enemy has been spawned and none
     /// remain alive. Advances to the next Wave number, unless the
-    /// just-cleared Wave was the last (`TOTAL_WAVES`), in which case
-    /// Victory triggers instead (this only runs when `tick` hasn't
-    /// already set Defeat, so Lives > 0 is implied).
+    /// just-cleared Wave was the last (`TOTAL_WAVES`) — in which case,
+    /// unless this was also the last Level (`LEVEL_COUNT`), the game
+    /// instead advances to the next Level's map: every placed Tower is
+    /// sold at the usual refund (the old map's layout no longer
+    /// applies), Wave resets to 1, and Gold/Lives carry over. Only on
+    /// the last Level's clear does Victory actually trigger (this only
+    /// runs when `tick` hasn't already set Defeat, so Lives > 0 is
+    /// implied).
     fn tick_wave_completion(&mut self) -> Vec<SimEvent> {
         if !(self.wave_in_progress && self.spawn_queue.is_empty() && self.enemies.is_empty()) {
             return Vec::new();
@@ -757,8 +851,22 @@ impl Simulation {
         let cleared_wave = self.wave_number;
         let mut events = vec![SimEvent::WaveCleared(cleared_wave)];
         if cleared_wave >= TOTAL_WAVES {
-            self.outcome = Some(GameOutcome::Victory);
-            events.push(SimEvent::Victory);
+            if self.level + 1 < LEVEL_COUNT {
+                events.push(SimEvent::LevelCleared(self.level_number()));
+                let refund: i32 = self
+                    .towers
+                    .values()
+                    .map(|runtime| (runtime.gold_spent as f32 * SELL_REFUND_FRACTION).round() as i32)
+                    .sum();
+                self.gold += refund;
+                self.towers.clear();
+                self.level += 1;
+                self.grid = Grid::for_level(self.level);
+                self.wave_number = 1;
+            } else {
+                self.outcome = Some(GameOutcome::Victory);
+                events.push(SimEvent::Victory);
+            }
         } else {
             self.wave_number += 1;
         }
@@ -932,7 +1040,9 @@ impl Simulation {
     /// wherever it currently stands (see ADR-0002).
     fn shortest_path(&self, from: CellPos, extra_blocked: Option<CellPos>) -> Option<Vec<CellPos>> {
         let goal = self.grid.goal();
-        let is_blocked = |pos: CellPos| Some(pos) == extra_blocked || self.towers.contains_key(&pos);
+        let is_blocked = |pos: CellPos| {
+            Some(pos) == extra_blocked || self.towers.contains_key(&pos) || self.grid.is_obstacle(pos)
+        };
 
         if is_blocked(from) || is_blocked(goal) {
             return None;
@@ -1454,7 +1564,11 @@ mod tests {
             }
         }
 
-        let mut sim = Simulation::new();
+        // Runs on the last Level, so clearing Wave 15 triggers Victory
+        // rather than advancing to another Level's map — this test is
+        // about Wave scaling, not Level progression (see the
+        // `level_*` tests below for that).
+        let mut sim = Simulation::new_at_level(LEVEL_COUNT - 1);
         assert_wave_matches_formula_then_force_complete(&mut sim, 1);
 
         while sim.wave_number() < 7 {
@@ -1541,7 +1655,10 @@ mod tests {
 
     #[test]
     fn wave_fifteen_clear_with_lives_above_zero_emits_victory() {
-        let mut sim = Simulation::new();
+        // Runs on the last Level; see `level_*` tests for the
+        // non-final-Level case, where the same clear instead advances
+        // to the next map.
+        let mut sim = Simulation::new_at_level(LEVEL_COUNT - 1);
         while sim.wave_number() < TOTAL_WAVES {
             sim.start_next_wave().unwrap();
             sim.spawn_queue.clear();
@@ -1595,5 +1712,74 @@ mod tests {
         );
         assert!(sim.has_tower(pos), "the Tower should be untouched by the rejected sell");
         assert_eq!(sim.start_next_wave(), Err(WaveError::GameOver));
+    }
+
+    #[test]
+    fn every_level_has_a_valid_path_and_at_least_one_obstacle_beyond_level_one() {
+        for level in 0..LEVEL_COUNT {
+            let sim = Simulation::new_at_level(level);
+            assert!(
+                sim.current_path().is_some(),
+                "Level {level} should always have an open Path from Spawn to Goal"
+            );
+            let obstacle_count = sim
+                .grid()
+                .cells()
+                .filter(|&pos| sim.grid().kind_at(pos) == CellKind::Obstacle)
+                .count();
+            if level == 0 {
+                assert_eq!(obstacle_count, 0, "Level 0 is the original obstacle-free map");
+            } else {
+                assert!(obstacle_count > 0, "Level {level} should have Obstacle walls forcing turns");
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_the_last_wave_on_a_non_final_level_advances_the_level_instead_of_ending_the_game() {
+        let mut sim = Simulation::new();
+        assert_eq!(sim.level_number(), 1);
+        sim.gold = 100_000;
+        let pos = CellPos::new(1, 1);
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
+        let gold_before_clear = sim.gold();
+
+        while sim.wave_number() < TOTAL_WAVES {
+            sim.start_next_wave().unwrap();
+            sim.spawn_queue.clear();
+            sim.enemies.clear();
+            sim.tick(0.001);
+        }
+        sim.start_next_wave().unwrap();
+        sim.spawn_queue.clear();
+        sim.enemies.clear();
+        let events = sim.tick(0.001);
+
+        assert!(events.contains(&SimEvent::LevelCleared(1)));
+        assert!(!events.iter().any(|e| matches!(e, SimEvent::Victory | SimEvent::Defeat)));
+        assert_eq!(sim.outcome(), None);
+        assert_eq!(sim.level_number(), 2);
+        assert_eq!(sim.wave_number(), 1);
+        assert!(!sim.has_tower(pos), "advancing a Level should clear every placed Tower");
+        assert!(sim.gold() > gold_before_clear, "the cleared Tower should be sold for its refund");
+    }
+
+    #[test]
+    fn clearing_the_last_wave_on_the_final_level_still_emits_victory() {
+        let mut sim = Simulation::new_at_level(LEVEL_COUNT - 1);
+        while sim.wave_number() < TOTAL_WAVES {
+            sim.start_next_wave().unwrap();
+            sim.spawn_queue.clear();
+            sim.enemies.clear();
+            sim.tick(0.001);
+        }
+        sim.start_next_wave().unwrap();
+        sim.spawn_queue.clear();
+        sim.enemies.clear();
+        let events = sim.tick(0.001);
+
+        assert!(events.contains(&SimEvent::Victory));
+        assert!(!events.iter().any(|e| matches!(e, SimEvent::LevelCleared(_))));
+        assert_eq!(sim.outcome(), Some(GameOutcome::Victory));
     }
 }

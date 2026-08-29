@@ -1,8 +1,7 @@
 use bevy::color::palettes::css;
 use bevy::prelude::*;
 use simulation::{
-    CellKind, CellPos, EnemyKind, GameOutcome, Grid, Simulation, TowerKind, TowerTier,
-    CELL_SIZE_PX, GRID_SIZE,
+    CellKind, CellPos, EnemyKind, GameOutcome, Simulation, TowerKind, TowerTier, CELL_SIZE_PX, GRID_SIZE,
 };
 
 const GRID_PX: f32 = CELL_SIZE_PX * GRID_SIZE as f32; // 500.0
@@ -43,6 +42,8 @@ fn main() {
                 sync_gold_text,
                 sync_lives_text,
                 sync_wave_ui,
+                sync_level_text,
+                sync_grid_cells,
                 sync_result_overlay,
             )
                 .chain(),
@@ -97,6 +98,16 @@ struct LivesText;
 /// Marks the sidebar's live Wave readout text.
 #[derive(Component)]
 struct WaveText;
+
+/// Marks the sidebar's live Level readout text.
+#[derive(Component)]
+struct LevelText;
+
+/// Marks a base Grid Cell sprite with its Cell, so `sync_grid_cells`
+/// can repaint it when the Level (and so the Grid's Obstacle layout)
+/// changes.
+#[derive(Component)]
+struct CellAt(CellPos);
 
 /// The sidebar's "Start Next Wave" button.
 #[derive(Component)]
@@ -207,13 +218,13 @@ fn cell_color(kind: CellKind) -> Color {
         CellKind::Buildable => Color::srgb(0.82, 0.82, 0.82), // light gray
         CellKind::Spawn => Color::Srgba(css::INDIGO),         // dark purple
         CellKind::Goal => Color::Srgba(css::ORANGE),
+        CellKind::Obstacle => Color::srgb(0.1, 0.1, 0.12), // near-black wall
     }
 }
 
-fn spawn_grid(mut commands: Commands) {
-    let grid = Grid::new();
-    for pos in grid.cells() {
-        let kind = grid.kind_at(pos);
+fn spawn_grid(mut commands: Commands, sim: Res<SimState>) {
+    for pos in sim.0.grid().cells() {
+        let kind = sim.0.grid().kind_at(pos);
         commands.spawn((
             Sprite {
                 color: cell_color(kind),
@@ -221,7 +232,29 @@ fn spawn_grid(mut commands: Commands) {
                 ..default()
             },
             Transform::from_translation(cell_world_pos(pos)),
+            CellAt(pos),
         ));
+    }
+}
+
+/// Keeps every Cell sprite's color in sync with `simulation`'s Grid.
+/// The Grid only ever changes shape when the Level advances (see
+/// `SimEvent::LevelCleared`), so this is gated on `sim.0.level_number()`
+/// changing rather than repainting all `GRID_SIZE * GRID_SIZE` sprites
+/// every frame.
+fn sync_grid_cells(
+    sim: Res<SimState>,
+    mut cells: Query<(&CellAt, &mut Sprite)>,
+    mut last_level: Local<Option<u32>>,
+) {
+    let current = sim.0.level_number();
+    if *last_level == Some(current) {
+        return;
+    }
+    *last_level = Some(current);
+
+    for (cell, mut sprite) in &mut cells {
+        sprite.color = cell_color(sim.0.grid().kind_at(cell.0));
     }
 }
 
@@ -254,6 +287,11 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                 Text::new(format!("Wave: {}", sim.0.wave_number())),
                 TextColor(Color::WHITE),
                 WaveText,
+            ));
+            sidebar.spawn((
+                Text::new(format!("Level: {}/{}", sim.0.level_number(), simulation::LEVEL_COUNT)),
+                TextColor(Color::WHITE),
+                LevelText,
             ));
 
             sidebar
@@ -556,6 +594,15 @@ fn tick_simulation(time: Res<Time>, mut sim: ResMut<SimState>) {
 /// Redraws every live Enemy from `simulation` state, mirroring the
 /// Path-preview/Projectile approach: clear last frame's sprites,
 /// respawn fresh ones at this frame's positions and Kind's color.
+///
+/// Two Enemy occupying the same Cell (e.g. queued up behind each
+/// other at a chokepoint) would otherwise share the exact same z,
+/// leaving the GPU's draw order for that pair unstable frame to frame
+/// since these sprites are despawned/respawned fresh every frame —
+/// visible as flicker. Each Enemy's stable id (not its per-frame
+/// Entity, which is fresh every time) offsets its z by a tiny,
+/// consistent amount, so the same pair always draws in the same
+/// relative order.
 fn sync_enemies(
     mut commands: Commands,
     sim: Res<SimState>,
@@ -564,16 +611,17 @@ fn sync_enemies(
     for entity in &existing {
         commands.entity(entity).despawn();
     }
-    for (kind, transit) in sim.0.enemies_transits() {
+    for (id, kind, transit) in sim.0.enemies_transits() {
         let from = cell_world_pos(transit.from);
         let to = cell_world_pos(transit.to);
+        let z = 2.0 + (id % 1000) as f32 * 0.0001;
         commands.spawn((
             Sprite {
                 color: enemy_color(kind),
                 custom_size: Some(Vec2::splat(CELL_SIZE_PX * 0.6)),
                 ..default()
             },
-            Transform::from_translation(from.lerp(to, transit.progress).with_z(2.0)),
+            Transform::from_translation(from.lerp(to, transit.progress).with_z(z)),
             EnemyMarker,
         ));
     }
@@ -653,6 +701,14 @@ fn sync_wave_ui(
             Color::srgb(0.2, 0.35, 0.2)
         });
     }
+}
+
+/// Keeps the sidebar's Level readout in sync with `simulation` state.
+fn sync_level_text(sim: Res<SimState>, mut text: Query<&mut Text, With<LevelText>>) {
+    let Ok(mut text) = text.get_single_mut() else {
+        return;
+    };
+    text.0 = format!("Level: {}/{}", sim.0.level_number(), simulation::LEVEL_COUNT);
 }
 
 /// Spawns the (initially empty) full-window container the result
