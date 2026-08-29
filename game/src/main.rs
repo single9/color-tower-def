@@ -236,6 +236,7 @@ fn enemy_color(kind: EnemyKind) -> Color {
         EnemyKind::Grunt => Color::Srgba(css::LIME),
         EnemyKind::Runner => Color::Srgba(css::YELLOW),
         EnemyKind::Tank => Color::Srgba(css::SIENNA),
+        EnemyKind::Boss => Color::Srgba(css::PURPLE),
     }
 }
 

@@ -167,6 +167,10 @@ const RUNNER_HEALTH: f32 = 50.0;
 const RUNNER_SPEED_CELLS_PER_SEC: f32 = 3.5;
 const TANK_HEALTH: f32 = 220.0;
 const TANK_SPEED_CELLS_PER_SEC: f32 = 1.0;
+/// Boss base Health, well above Tank's: a plain high-Health MVP with
+/// no distinct mechanics (out of scope: anything past that).
+const BOSS_HEALTH: f32 = 900.0;
+const BOSS_SPEED_CELLS_PER_SEC: f32 = 1.0;
 
 const CANNON_DAMAGE: f32 = 50.0;
 const CANNON_RANGE_CELLS: f32 = 5.0;
@@ -190,6 +194,7 @@ const FROST_PRICE: i32 = 120;
 const GRUNT_GOLD_REWARD: i32 = 10;
 const RUNNER_GOLD_REWARD: i32 = 6;
 const TANK_GOLD_REWARD: i32 = 20;
+const BOSS_GOLD_REWARD: i32 = 60;
 /// Fraction of the Gold spent on a Tower refunded on sale.
 const SELL_REFUND_FRACTION: f32 = 0.7;
 /// Fraction of a Tower's original purchase price each upgrade costs,
@@ -209,13 +214,18 @@ const WAVE_HEALTH_SCALING_PER_WAVE: f32 = 0.1;
 /// Extra Enemy beyond the flat `5` every Wave adds one of, per Wave
 /// number: Wave `n` spawns `WAVE_BASE_ENEMY_COUNT + n` Enemy total.
 const WAVE_BASE_ENEMY_COUNT: u32 = 5;
+/// A Boss Enemy is appended to every Wave whose number is a multiple
+/// of this (Wave 5, 10, 15, ...).
+const BOSS_WAVE_INTERVAL: u32 = 5;
 
-/// The three Enemy Kind, each with distinct Health/speed.
+/// The four Enemy Kind, each with distinct Health/speed. Boss is a
+/// plain high-Health variant for now (no distinct mechanics yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnemyKind {
     Grunt,
     Runner,
     Tank,
+    Boss,
 }
 
 impl EnemyKind {
@@ -224,6 +234,7 @@ impl EnemyKind {
             EnemyKind::Grunt => GRUNT_HEALTH,
             EnemyKind::Runner => RUNNER_HEALTH,
             EnemyKind::Tank => TANK_HEALTH,
+            EnemyKind::Boss => BOSS_HEALTH,
         }
     }
 
@@ -232,6 +243,7 @@ impl EnemyKind {
             EnemyKind::Grunt => GRUNT_SPEED_CELLS_PER_SEC,
             EnemyKind::Runner => RUNNER_SPEED_CELLS_PER_SEC,
             EnemyKind::Tank => TANK_SPEED_CELLS_PER_SEC,
+            EnemyKind::Boss => BOSS_SPEED_CELLS_PER_SEC,
         }
     }
 
@@ -241,6 +253,7 @@ impl EnemyKind {
             EnemyKind::Grunt => GRUNT_GOLD_REWARD,
             EnemyKind::Runner => RUNNER_GOLD_REWARD,
             EnemyKind::Tank => TANK_GOLD_REWARD,
+            EnemyKind::Boss => BOSS_GOLD_REWARD,
         }
     }
 }
@@ -717,11 +730,12 @@ impl Simulation {
     }
 
     /// Starts Wave `wave_number()`: queues `WAVE_BASE_ENEMY_COUNT + n`
-    /// Enemy (mixed Grunt/Runner/Tank, see `WAVE_ENEMY_KIND_CYCLE`) to
-    /// spawn one at a time, `SPAWN_INTERVAL_SECONDS` apart, each with
-    /// Health scaled by `1 + n * WAVE_HEALTH_SCALING_PER_WAVE`.
-    /// Rejected while the current Wave is still spawning or has any
-    /// Enemy alive.
+    /// Enemy (mixed Grunt/Runner/Tank, see `WAVE_ENEMY_KIND_CYCLE`),
+    /// plus one Boss appended last on every Wave that's a multiple of
+    /// `BOSS_WAVE_INTERVAL`, to spawn one at a time,
+    /// `SPAWN_INTERVAL_SECONDS` apart, each with Health scaled by
+    /// `1 + n * WAVE_HEALTH_SCALING_PER_WAVE`. Rejected while the
+    /// current Wave is still spawning or has any Enemy alive.
     pub fn start_next_wave(&mut self) -> Result<(), WaveError> {
         if self.outcome.is_some() {
             return Err(WaveError::GameOver);
@@ -733,6 +747,9 @@ impl Simulation {
         self.spawn_queue = (0..count)
             .map(|i| WAVE_ENEMY_KIND_CYCLE[i as usize % WAVE_ENEMY_KIND_CYCLE.len()])
             .collect();
+        if self.wave_number % BOSS_WAVE_INTERVAL == 0 {
+            self.spawn_queue.push_back(EnemyKind::Boss);
+        }
         self.spawn_timer = 0.0;
         self.wave_in_progress = true;
         Ok(())
@@ -1400,6 +1417,7 @@ mod tests {
     fn each_enemy_kind_has_distinct_correct_stats() {
         assert!(EnemyKind::Runner.health() < EnemyKind::Grunt.health());
         assert!(EnemyKind::Grunt.health() < EnemyKind::Tank.health());
+        assert!(EnemyKind::Tank.health() < EnemyKind::Boss.health());
         assert!(EnemyKind::Runner.speed() > EnemyKind::Grunt.speed());
         assert!(EnemyKind::Grunt.speed() > EnemyKind::Tank.speed());
     }
@@ -1594,7 +1612,10 @@ mod tests {
         fn assert_wave_matches_formula_then_force_complete(sim: &mut Simulation, n: u32) {
             assert_eq!(sim.wave_number(), n);
             sim.start_next_wave().unwrap();
-            assert_eq!(sim.spawn_queue.len() as u32, WAVE_BASE_ENEMY_COUNT + n);
+            let expected_count = WAVE_BASE_ENEMY_COUNT
+                + n
+                + if n % BOSS_WAVE_INTERVAL == 0 { 1 } else { 0 };
+            assert_eq!(sim.spawn_queue.len() as u32, expected_count);
 
             // spawn_timer starts at 0.0, so a negligible tick spawns
             // exactly the queue's first (Grunt) Enemy and no more.
