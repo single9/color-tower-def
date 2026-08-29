@@ -9,7 +9,10 @@ use simulation::{
 const GRID_PX: f32 = CELL_SIZE_PX * GRID_SIZE as f32; // 500.0
 const SIDEBAR_PX: f32 = 200.0;
 const WINDOW_WIDTH: f32 = GRID_PX + SIDEBAR_PX; // 700.0
-const WINDOW_HEIGHT: f32 = GRID_PX; // 500.0
+/// Extra window height beyond the Grid's, giving the sidebar vertical
+/// room for its Tower info panel (Upgrade/Sell) without clipping.
+const WINDOW_VERTICAL_PAD: f32 = 200.0;
+const WINDOW_HEIGHT: f32 = GRID_PX + WINDOW_VERTICAL_PAD; // 700.0
 
 fn main() {
     App::new()
@@ -189,7 +192,7 @@ fn spawn_camera(mut commands: Commands) {
 /// origin (0,0) in Bevy 2D world space is the center of the window.
 fn cell_units_to_world(x: f32, y: f32) -> Vec3 {
     let left_edge = -WINDOW_WIDTH / 2.0;
-    let bottom_edge = -WINDOW_HEIGHT / 2.0;
+    let bottom_edge = -GRID_PX / 2.0;
     Vec3::new(
         left_edge + x * CELL_SIZE_PX + CELL_SIZE_PX / 2.0,
         bottom_edge + y * CELL_SIZE_PX + CELL_SIZE_PX / 2.0,
@@ -207,7 +210,7 @@ fn cell_world_pos(pos: CellPos) -> Vec3 {
 /// GRID_PX x GRID_PX square (e.g. the sidebar).
 fn world_to_cell(world: Vec2) -> Option<CellPos> {
     let left_edge = -WINDOW_WIDTH / 2.0;
-    let bottom_edge = -WINDOW_HEIGHT / 2.0;
+    let bottom_edge = -GRID_PX / 2.0;
     let rel_x = world.x - left_edge;
     let rel_y = world.y - bottom_edge;
     if rel_x < 0.0 || rel_y < 0.0 || rel_x >= GRID_PX || rel_y >= GRID_PX {
