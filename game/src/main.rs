@@ -330,7 +330,10 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                         TowerKindButton(kind),
                     ))
                     .with_children(|button| {
-                        button.spawn((Text::new(label), TextColor(Color::WHITE)));
+                        button.spawn((
+                            Text::new(format!("{label} ({}g)", kind.price())),
+                            TextColor(Color::WHITE),
+                        ));
                     });
             }
 

@@ -299,8 +299,10 @@ impl TowerKind {
         !matches!(self, TowerKind::Frost)
     }
 
-    /// Gold cost to place a fresh Tier 1 Tower of this Kind.
-    fn price(self) -> i32 {
+    /// Gold cost to place a fresh Tier 1 Tower of this Kind. Public so
+    /// the Bevy layer can label the sidebar's Tower Kind buttons with
+    /// their price.
+    pub fn price(self) -> i32 {
         match self {
             TowerKind::Cannon => CANNON_PRICE,
             TowerKind::Gatling => GATLING_PRICE,
