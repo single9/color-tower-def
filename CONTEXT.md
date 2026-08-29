@@ -75,11 +75,12 @@ _Avoid_: Level(Level 是地圖關卡的計數,Tier 專指 Tower 的升級等級,
 _Avoid_: Monster, Creep
 
 **Enemy Kind**:
-Enemy 的類型,決定 Health 與移動速度的傾向。目前有三種:
+Enemy 的類型,決定 Health 與移動速度的傾向。目前有四種:
 
 - **Grunt**:中 Health、中速度
 - **Runner**:低 Health、高速度
 - **Tank**:高 Health、低速度
+- **Boss**:極高 Health、低速度(與 Tank 同速),每 5 個 Wave 額外出現一次(見下方 Wave),目前無獨立機制,純粹是數值更高的變體
 
 _Avoid_: Mob type
 
@@ -88,7 +89,7 @@ Enemy 目前剩餘的生命值,歸零即死亡並掉落 Gold。
 _Avoid_: HP(與 Lives 都可能被稱為「生命」,用 Health 專指 Enemy,用 Lives 專指玩家,避免混淆)
 
 **Wave**:
-玩家手動觸發的一次敵人生成事件,包含固定數量與強度的 Enemy,依序間隔(0.8 秒)出現於 Spawn。每個 Level 內共 15 個 Wave,全數通過即完成該 Level(見上方 Level)。第 n 個 Wave 生成 `5 + n` 隻 Enemy,每隻 Health 為基礎值乘上 `1 + n * 0.1`;Enemy Kind 依 Grunt → Runner → Tank 固定順序循環分配(實作於 ticket 08 時決定,任意但均勻的組成)。Wave 進行中(尚有 Enemy 待生成或存活)無法觸發下一個 Wave;每個新 Level 開始時 Wave 計數重置為 1。
+玩家手動觸發的一次敵人生成事件,包含固定數量與強度的 Enemy,依序間隔(0.8 秒)出現於 Spawn。每個 Level 內共 15 個 Wave,全數通過即完成該 Level(見上方 Level)。第 n 個 Wave 生成 `5 + n` 隻 Enemy,每隻 Health 為基礎值乘上 `1 + n * 0.1`;Enemy Kind 依 Grunt → Runner → Tank 固定順序循環分配(實作於 ticket 08 時決定,任意但均勻的組成)。每逢 5 的倍數 Wave(5、10、15...)額外在隊列尾端追加一隻 Boss,同樣套用該 Wave 的 Health 倍率。Wave 進行中(尚有 Enemy 待生成或存活)無法觸發下一個 Wave;每個新 Level 開始時 Wave 計數重置為 1。
 _Avoid_: Round(Level 現在是獨立於 Wave 的地圖關卡概念,見上方定義,不再互相避免)
 
 **Leak**:
