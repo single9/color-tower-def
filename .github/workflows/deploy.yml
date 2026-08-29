@@ -22,7 +22,8 @@ jobs:
         id: version
         run: |
           if [ ! -f VERSION ]; then echo "0.1.0" > VERSION; fi
-          IFS='.' read -r major minor patch < VERSION
+          current=$(cat VERSION)
+          IFS='.' read -r major minor patch <<< "$current"
           patch=$((patch + 1))
           echo "$major.$minor.$patch" > VERSION
           echo "version=$major.$minor.$patch" >> "$GITHUB_OUTPUT"
