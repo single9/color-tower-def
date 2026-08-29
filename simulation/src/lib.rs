@@ -131,6 +131,11 @@ const RUNNER_GOLD_REWARD: i32 = 6;
 const TANK_GOLD_REWARD: i32 = 20;
 /// Fraction of the Gold spent on a Tower refunded on sale.
 const SELL_REFUND_FRACTION: f32 = 0.7;
+/// Fraction of a Tower's original purchase price each upgrade costs,
+/// flat at every Tier transition (not compounding).
+const UPGRADE_COST_FRACTION: f32 = 0.8;
+/// Multiplier applied to a Tower's primary stat per Tier over Tier 1.
+const TIER_STAT_MULTIPLIER: f32 = 1.3;
 
 /// The three Enemy Kind, each with distinct Health/speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +184,10 @@ pub enum TowerKind {
 }
 
 impl TowerKind {
-    fn damage(self) -> f32 {
+    /// This Tower Kind's primary stat at Tier 1: damage for Cannon and
+    /// Gatling. Frost has no damage — its primary stat is Range (see
+    /// `range`) — CONTEXT.md's Tier entry documents this choice.
+    fn base_damage(self) -> f32 {
         match self {
             TowerKind::Cannon => CANNON_DAMAGE,
             TowerKind::Gatling => GATLING_DAMAGE,
@@ -187,11 +195,20 @@ impl TowerKind {
         }
     }
 
-    fn range(self) -> f32 {
+    /// Damage at the given Tier: Cannon/Gatling's primary stat, scaled
+    /// `TIER_STAT_MULTIPLIER` per Tier over Tier 1. Always 0 for Frost.
+    fn damage(self, tier: TowerTier) -> f32 {
+        self.base_damage() * tier.stat_multiplier()
+    }
+
+    /// Range at the given Tier. Frost's primary stat, scaled
+    /// `TIER_STAT_MULTIPLIER` per Tier over Tier 1; fixed for Cannon
+    /// and Gatling, whose primary stat is damage instead.
+    fn range(self, tier: TowerTier) -> f32 {
         match self {
             TowerKind::Cannon => CANNON_RANGE_CELLS,
             TowerKind::Gatling => GATLING_RANGE_CELLS,
-            TowerKind::Frost => FROST_RANGE_CELLS,
+            TowerKind::Frost => FROST_RANGE_CELLS * tier.stat_multiplier(),
         }
     }
 
@@ -207,7 +224,7 @@ impl TowerKind {
         !matches!(self, TowerKind::Frost)
     }
 
-    /// Gold cost to place a fresh Tower of this Kind.
+    /// Gold cost to place a fresh Tier 1 Tower of this Kind.
     fn price(self) -> i32 {
         match self {
             TowerKind::Cannon => CANNON_PRICE,
@@ -215,6 +232,60 @@ impl TowerKind {
             TowerKind::Frost => FROST_PRICE,
         }
     }
+}
+
+/// A Tower's upgrade level: Tier 1 (base) through Tier 3, the cap.
+/// Each step over Tier 1 multiplies the Tower Kind's primary stat by
+/// `TIER_STAT_MULTIPLIER`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TowerTier {
+    One,
+    Two,
+    Three,
+}
+
+impl TowerTier {
+    fn stat_multiplier(self) -> f32 {
+        match self {
+            TowerTier::One => 1.0,
+            TowerTier::Two => TIER_STAT_MULTIPLIER,
+            TowerTier::Three => TIER_STAT_MULTIPLIER * TIER_STAT_MULTIPLIER,
+        }
+    }
+
+    /// The next Tier up, or `None` if already at the Tier 3 cap.
+    fn next(self) -> Option<TowerTier> {
+        match self {
+            TowerTier::One => Some(TowerTier::Two),
+            TowerTier::Two => Some(TowerTier::Three),
+            TowerTier::Three => None,
+        }
+    }
+
+    pub fn is_max(self) -> bool {
+        self == TowerTier::Three
+    }
+}
+
+/// Why an upgrade attempt failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeError {
+    /// There is no Tower at the target Cell.
+    NoTowerThere,
+    /// The Tower is already at the Tier 3 cap.
+    AlreadyMaxTier,
+    /// The player does not have enough Gold for this upgrade step.
+    InsufficientGold,
+}
+
+/// A placed Tower's Kind, Tier, and current stats — for the Bevy
+/// layer's info panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TowerStats {
+    pub kind: TowerKind,
+    pub tier: TowerTier,
+    pub damage: f32,
+    pub range: f32,
 }
 
 /// A single Enemy in transit between two Cell centers. `target` is
@@ -229,12 +300,15 @@ struct Enemy {
     kind: EnemyKind,
 }
 
-/// Per-Tower runtime state. Tier lands in ticket 07 and will fold
-/// upgrade spend into `gold_spent` for the sell refund.
+/// Per-Tower runtime state. `purchase_price` is fixed at placement and
+/// drives upgrade cost; `gold_spent` accumulates purchase price plus
+/// every upgrade paid, and drives the sell refund.
 #[derive(Debug, Clone, Copy)]
 struct TowerRuntime {
     kind: TowerKind,
+    tier: TowerTier,
     cooldown_remaining: f32,
+    purchase_price: i32,
     gold_spent: i32,
 }
 
@@ -253,6 +327,13 @@ fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
     let dx = a.0 - b.0;
     let dy = a.1 - b.1;
     (dx * dx + dy * dy).sqrt()
+}
+
+/// Gold cost of one upgrade step: `UPGRADE_COST_FRACTION` of the
+/// Tower's original purchase price, rounded to the nearest whole
+/// Gold (.5 away from zero), flat at every Tier transition.
+fn upgrade_cost(purchase_price: i32) -> i32 {
+    (purchase_price as f32 * UPGRADE_COST_FRACTION).round() as i32
 }
 
 /// Where an Enemy currently is, for the Bevy layer to render: it sits
@@ -308,6 +389,27 @@ impl Simulation {
         self.towers.get(&pos).map(|runtime| runtime.kind)
     }
 
+    /// The Kind, Tier, and current stats of the Tower at `pos`, if
+    /// any — for the Bevy layer's info panel.
+    pub fn tower_stats_at(&self, pos: CellPos) -> Option<TowerStats> {
+        self.towers.get(&pos).map(|runtime| TowerStats {
+            kind: runtime.kind,
+            tier: runtime.tier,
+            damage: runtime.kind.damage(runtime.tier),
+            range: runtime.kind.range(runtime.tier),
+        })
+    }
+
+    /// The Gold cost to upgrade the Tower at `pos` one Tier, if any and
+    /// not already at the Tier 3 cap — for the Bevy layer's info panel.
+    pub fn upgrade_cost_at(&self, pos: CellPos) -> Option<i32> {
+        let runtime = self.towers.get(&pos)?;
+        if runtime.tier.is_max() {
+            return None;
+        }
+        Some(upgrade_cost(runtime.purchase_price))
+    }
+
     /// The current shortest Path from Spawn to Goal around all placed
     /// Tower, or `None` if none exists.
     pub fn current_path(&self) -> Option<Vec<CellPos>> {
@@ -347,18 +449,40 @@ impl Simulation {
             pos,
             TowerRuntime {
                 kind,
+                tier: TowerTier::One,
                 cooldown_remaining: 0.0,
+                purchase_price: price,
                 gold_spent: price,
             },
         );
         Ok(())
     }
 
+    /// Upgrades the Tower at `pos` one Tier, if any and not already at
+    /// the Tier 3 cap and the player can afford `upgrade_cost_at`.
+    pub fn upgrade_tower(&mut self, pos: CellPos) -> Result<(), UpgradeError> {
+        let Some(runtime) = self.towers.get(&pos) else {
+            return Err(UpgradeError::NoTowerThere);
+        };
+        let Some(next_tier) = runtime.tier.next() else {
+            return Err(UpgradeError::AlreadyMaxTier);
+        };
+        let cost = upgrade_cost(runtime.purchase_price);
+        if self.gold < cost {
+            return Err(UpgradeError::InsufficientGold);
+        }
+
+        self.gold -= cost;
+        let runtime = self.towers.get_mut(&pos).unwrap();
+        runtime.tier = next_tier;
+        runtime.gold_spent += cost;
+        Ok(())
+    }
+
     /// Removes the Tower at `pos`, if any, refunding `SELL_REFUND_FRACTION`
-    /// of the Gold spent on it (purchase price only for now; upgrade
-    /// spend folds in from ticket 07). The refund rounds to the
-    /// nearest whole Gold, .5 rounding away from zero. Returns whether
-    /// a Tower was there.
+    /// of the total Gold spent on it (purchase price plus every
+    /// upgrade paid). The refund rounds to the nearest whole Gold, .5
+    /// rounding away from zero. Returns whether a Tower was there.
     pub fn sell_tower(&mut self, pos: CellPos) -> bool {
         let Some(runtime) = self.towers.remove(&pos) else {
             return false;
@@ -431,7 +555,8 @@ impl Simulation {
         };
         let in_frost = self.towers.iter().any(|(pos, runtime)| {
             runtime.kind == TowerKind::Frost
-                && distance((pos.x as f32, pos.y as f32), enemy_pos) <= runtime.kind.range()
+                && distance((pos.x as f32, pos.y as f32), enemy_pos)
+                    <= runtime.kind.range(runtime.tier)
         });
         if in_frost {
             FROST_SLOW_MULTIPLIER
@@ -513,11 +638,11 @@ impl Simulation {
             }
 
             let tower_pos = (pos.x as f32, pos.y as f32);
-            if distance(tower_pos, enemy_pos) <= runtime.kind.range() {
+            if distance(tower_pos, enemy_pos) <= runtime.kind.range(runtime.tier) {
                 runtime.cooldown_remaining = runtime.kind.cooldown();
                 self.projectiles.push(Projectile {
                     pos: tower_pos,
-                    damage: runtime.kind.damage(),
+                    damage: runtime.kind.damage(runtime.tier),
                 });
             }
         }
@@ -867,7 +992,7 @@ mod tests {
 
     #[test]
     fn gatling_fires_faster_and_weaker_than_cannon() {
-        assert!(TowerKind::Gatling.damage() < TowerKind::Cannon.damage());
+        assert!(TowerKind::Gatling.base_damage() < TowerKind::Cannon.base_damage());
         assert!(TowerKind::Gatling.cooldown() < TowerKind::Cannon.cooldown());
     }
 
@@ -985,5 +1110,80 @@ mod tests {
 
         let expected_refund = (TowerKind::Cannon.price() as f32 * SELL_REFUND_FRACTION).round() as i32;
         assert_eq!(sim.gold(), gold_after_buying + expected_refund);
+    }
+
+    #[test]
+    fn upgrading_increases_damage_thirty_percent_per_tier_and_deducts_a_flat_cost() {
+        let mut sim = Simulation::new();
+        sim.gold = 100_000;
+        let pos = CellPos::new(5, 5);
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
+        let gold_after_buying = sim.gold();
+        let tier_one_damage = sim.tower_stats_at(pos).unwrap().damage;
+        assert_eq!(tier_one_damage, TowerKind::Cannon.base_damage());
+
+        let cost_to_tier_two = sim.upgrade_cost_at(pos).unwrap();
+        assert!(sim.upgrade_tower(pos).is_ok());
+        let after_tier_two = sim.tower_stats_at(pos).unwrap();
+        assert_eq!(after_tier_two.tier, TowerTier::Two);
+        assert!((after_tier_two.damage - tier_one_damage * TIER_STAT_MULTIPLIER).abs() < 0.001);
+        assert_eq!(sim.gold(), gold_after_buying - cost_to_tier_two);
+
+        // The upgrade cost is flat (a fraction of the *original*
+        // purchase price), not compounding with each Tier.
+        let cost_to_tier_three = sim.upgrade_cost_at(pos).unwrap();
+        assert_eq!(cost_to_tier_three, cost_to_tier_two);
+        assert!(sim.upgrade_tower(pos).is_ok());
+        let after_tier_three = sim.tower_stats_at(pos).unwrap();
+        assert_eq!(after_tier_three.tier, TowerTier::Three);
+        assert!(
+            (after_tier_three.damage - tier_one_damage * TIER_STAT_MULTIPLIER * TIER_STAT_MULTIPLIER).abs()
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn upgrade_is_blocked_at_tier_three() {
+        let mut sim = Simulation::new();
+        let pos = CellPos::new(5, 5);
+        sim.gold = 100_000;
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
+        sim.upgrade_tower(pos).unwrap();
+        sim.upgrade_tower(pos).unwrap();
+
+        assert_eq!(sim.upgrade_tower(pos), Err(UpgradeError::AlreadyMaxTier));
+        assert!(
+            sim.upgrade_cost_at(pos).is_none(),
+            "a Tier 3 Tower should report no upgrade available"
+        );
+    }
+
+    #[test]
+    fn upgrade_is_blocked_when_unaffordable_and_state_is_unchanged() {
+        let mut sim = Simulation::new();
+        let pos = CellPos::new(5, 5);
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
+        sim.gold = 0;
+        let tier_before = sim.tower_stats_at(pos).unwrap().tier;
+
+        assert_eq!(sim.upgrade_tower(pos), Err(UpgradeError::InsufficientGold));
+        assert_eq!(sim.gold(), 0);
+        assert_eq!(sim.tower_stats_at(pos).unwrap().tier, tier_before);
+    }
+
+    #[test]
+    fn selling_an_upgraded_tower_refunds_seventy_percent_of_purchase_plus_upgrade_spend() {
+        let mut sim = Simulation::new();
+        let pos = CellPos::new(5, 5);
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
+        let upgrade_cost = sim.upgrade_cost_at(pos).unwrap();
+        sim.upgrade_tower(pos).unwrap();
+        let gold_before_sell = sim.gold();
+        let total_spent = TowerKind::Cannon.price() + upgrade_cost;
+
+        assert!(sim.sell_tower(pos));
+
+        let expected_refund = (total_spent as f32 * SELL_REFUND_FRACTION).round() as i32;
+        assert_eq!(sim.gold(), gold_before_sell + expected_refund);
     }
 }

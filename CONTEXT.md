@@ -57,7 +57,7 @@ Frost 對 Range 內所有 Enemy 持續套用的降速效果;Enemy 離開 Range �
 _Avoid_: Slow effect, Debuff
 
 **Tier**:
-Tower 的升級等級,共三級:基礎(Tier 1)、Tier 2、Tier 3。每升一級,主要數值(依 Tower Kind 而定為傷害/射速/Range)提升 30%,升級花費為原造價的 80%。
+Tower 的升級等級,共三級:基礎(Tier 1)、Tier 2、Tier 3。每升一級,主要數值提升 30%(較上一 Tier,非疊加自 Tier 1 累乘外的額外加成——三級數值為 Tier 1 的 1.3 的平方倍);升級花費固定為原始購買價的 80%,兩次升級(Tier 1→2、Tier 2→3)費用相同,不隨 Tier 遞增。主要數值依 Tower Kind 而定:Cannon/Gatling 是 Damage;Frost 沒有 Damage,主要數值是 Range(實作於 ticket 07 時決定——Frost 的 Slow Aura 強度维持固定,Range 隨 Tier 擴大)。
 _Avoid_: Level(避免與 Wave 的波次概念混淆)
 
 ### 敵人與波次

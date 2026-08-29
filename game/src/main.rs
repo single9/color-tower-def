@@ -1,6 +1,8 @@
 use bevy::color::palettes::css;
 use bevy::prelude::*;
-use simulation::{CellKind, CellPos, EnemyKind, Grid, Simulation, TowerKind, CELL_SIZE_PX, GRID_SIZE};
+use simulation::{
+    CellKind, CellPos, EnemyKind, Grid, Simulation, TowerKind, TowerTier, CELL_SIZE_PX, GRID_SIZE,
+};
 
 const GRID_PX: f32 = CELL_SIZE_PX * GRID_SIZE as f32; // 500.0
 const SIDEBAR_PX: f32 = 200.0;
@@ -20,6 +22,7 @@ fn main() {
         }))
         .insert_resource(SimState(Simulation::new()))
         .insert_resource(SelectedTowerKind(TowerKind::Cannon))
+        .insert_resource(SelectedTower(None))
         .add_systems(
             Startup,
             (spawn_camera, spawn_grid, spawn_sidebar, spawn_enemy),
@@ -29,6 +32,8 @@ fn main() {
             (
                 select_tower_kind,
                 interact_with_grid,
+                handle_tower_panel_buttons,
+                sync_tower_info_panel,
                 move_enemy,
                 sync_projectiles,
                 sync_gold_text,
@@ -77,6 +82,25 @@ struct ProjectileMarker;
 /// Marks the sidebar's live Gold readout text.
 #[derive(Component)]
 struct GoldText;
+
+/// The Tower currently selected for inspection (clicked on the Grid),
+/// whose info panel is showing in the sidebar. `None` when nothing is
+/// selected.
+#[derive(Resource, Clone, Copy, PartialEq, Eq)]
+struct SelectedTower(Option<CellPos>);
+
+/// Empty container the sidebar's Tower info panel is rebuilt into
+/// whenever `SelectedTower` (or its Tower's Tier) changes.
+#[derive(Component)]
+struct InfoPanelRoot;
+
+/// The Upgrade button inside the Tower info panel.
+#[derive(Component)]
+struct UpgradeButton;
+
+/// The Sell button inside the Tower info panel.
+#[derive(Component)]
+struct SellButton;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -222,6 +246,20 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                         button.spawn((Text::new(label), TextColor(Color::WHITE)));
                     });
             }
+
+            sidebar.spawn(Node {
+                height: Val::Px(16.0),
+                ..default()
+            });
+
+            sidebar.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(8.0),
+                    ..default()
+                },
+                InfoPanelRoot,
+            ));
         });
 }
 
@@ -243,10 +281,22 @@ fn select_tower_kind(
     }
 }
 
+/// Despawns the Tower sprite at `pos`, if any is currently tagged
+/// with it. Shared by selling from the info panel and (in earlier
+/// tickets) from a direct Grid click.
+fn despawn_tower_sprite(commands: &mut Commands, towers: &Query<(Entity, &TowerAt)>, pos: CellPos) {
+    for (entity, tower_at) in towers {
+        if tower_at.0 == pos {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 /// Single seam between mouse input and the `simulation` crate: figures
 /// out which Cell the cursor is over, redraws the Path preview for it,
-/// and on a left click either sells an existing Tower or places a new
-/// one (subject to the Blocking Rule enforced entirely inside `sim`).
+/// and on a left click either selects an existing Tower (opening its
+/// info panel) or places a new one (subject to the Blocking Rule
+/// enforced entirely inside `sim`).
 fn interact_with_grid(
     mut commands: Commands,
     windows: Query<&Window>,
@@ -254,7 +304,7 @@ fn interact_with_grid(
     mouse: Res<ButtonInput<MouseButton>>,
     mut sim: ResMut<SimState>,
     selected: Res<SelectedTowerKind>,
-    towers: Query<(Entity, &TowerAt)>,
+    mut selected_tower: ResMut<SelectedTower>,
     preview_tiles: Query<Entity, With<PathPreviewTile>>,
 ) {
     for entity in &preview_tiles {
@@ -298,12 +348,7 @@ fn interact_with_grid(
     }
 
     if sim.0.has_tower(hovered) {
-        sim.0.sell_tower(hovered);
-        for (entity, tower_at) in &towers {
-            if tower_at.0 == hovered {
-                commands.entity(entity).despawn();
-            }
-        }
+        selected_tower.0 = Some(hovered);
     } else if sim.0.place_tower(hovered, selected.0).is_ok() {
         commands.spawn((
             Sprite {
@@ -314,7 +359,136 @@ fn interact_with_grid(
             Transform::from_translation(cell_world_pos(hovered).with_z(1.0)),
             TowerAt(hovered),
         ));
+        selected_tower.0 = None;
     }
+}
+
+/// Handles clicks on the info panel's Upgrade/Sell buttons for
+/// whichever Tower `SelectedTower` currently points at. Failed
+/// attempts (already Tier 3, unaffordable) are simply no-ops, mirroring
+/// how `interact_with_grid` already treats a failed placement.
+fn handle_tower_panel_buttons(
+    mut commands: Commands,
+    mut sim: ResMut<SimState>,
+    mut selected_tower: ResMut<SelectedTower>,
+    towers: Query<(Entity, &TowerAt)>,
+    upgrade_interactions: Query<&Interaction, (With<UpgradeButton>, Changed<Interaction>)>,
+    sell_interactions: Query<&Interaction, (With<SellButton>, Changed<Interaction>)>,
+) {
+    let Some(pos) = selected_tower.0 else {
+        return;
+    };
+
+    for interaction in &upgrade_interactions {
+        if *interaction == Interaction::Pressed {
+            let _ = sim.0.upgrade_tower(pos);
+        }
+    }
+
+    for interaction in &sell_interactions {
+        if *interaction == Interaction::Pressed && sim.0.sell_tower(pos) {
+            despawn_tower_sprite(&mut commands, &towers, pos);
+            selected_tower.0 = None;
+        }
+    }
+}
+
+/// Rebuilds the sidebar's Tower info panel whenever `SelectedTower` or
+/// its Tower's Tier changes (tracked via `last_rendered`, since a
+/// naive every-frame rebuild would reset the Upgrade/Sell buttons'
+/// `Interaction` state before a click could ever register).
+fn sync_tower_info_panel(
+    mut commands: Commands,
+    selected_tower: Res<SelectedTower>,
+    sim: Res<SimState>,
+    panel_root: Query<Entity, With<InfoPanelRoot>>,
+    children: Query<&Children>,
+    mut last_rendered: Local<Option<(CellPos, TowerTier)>>,
+) {
+    let Ok(root) = panel_root.get_single() else {
+        return;
+    };
+
+    let current = selected_tower
+        .0
+        .and_then(|pos| sim.0.tower_stats_at(pos).map(|stats| (pos, stats.tier)));
+
+    if current == *last_rendered {
+        return;
+    }
+    *last_rendered = current;
+
+    if let Ok(existing_children) = children.get(root) {
+        for &child in existing_children {
+            commands.entity(child).despawn_recursive();
+        }
+    }
+
+    let Some((pos, _)) = current else {
+        return;
+    };
+    let stats = sim.0.tower_stats_at(pos).expect("just confirmed present above");
+
+    commands.entity(root).with_children(|panel| {
+        let kind_label = match stats.kind {
+            TowerKind::Cannon => "Cannon",
+            TowerKind::Gatling => "Gatling",
+            TowerKind::Frost => "Frost",
+        };
+        let tier_label = match stats.tier {
+            TowerTier::One => "Tier 1",
+            TowerTier::Two => "Tier 2",
+            TowerTier::Three => "Tier 3",
+        };
+        panel.spawn((
+            Text::new(format!("{kind_label} ({tier_label})")),
+            TextColor(Color::WHITE),
+        ));
+        if stats.kind == TowerKind::Frost {
+            panel.spawn((
+                Text::new(format!("Range: {:.1}", stats.range)),
+                TextColor(Color::WHITE),
+            ));
+        } else {
+            panel.spawn((
+                Text::new(format!("Damage: {:.0}", stats.damage)),
+                TextColor(Color::WHITE),
+            ));
+        }
+
+        if let Some(cost) = sim.0.upgrade_cost_at(pos) {
+            panel
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(8.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                    UpgradeButton,
+                ))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new(format!("Upgrade ({cost}g)")),
+                        TextColor(Color::WHITE),
+                    ));
+                });
+        }
+
+        panel
+            .spawn((
+                Button,
+                Node {
+                    padding: UiRect::all(Val::Px(8.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.35, 0.2, 0.2)),
+                SellButton,
+            ))
+            .with_children(|button| {
+                button.spawn((Text::new("Sell"), TextColor(Color::WHITE)));
+            });
+    });
 }
 
 fn spawn_enemy(mut commands: Commands, mut sim: ResMut<SimState>) {
