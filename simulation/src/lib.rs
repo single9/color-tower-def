@@ -92,6 +92,8 @@ pub enum PlacementError {
     NotBuildable,
     /// The target Cell already has a Tower on it.
     AlreadyOccupied,
+    /// The player does not have enough Gold for this Tower Kind's price.
+    InsufficientGold,
     /// Placing here would leave no Path from Spawn to Goal (the Blocking Rule).
     WouldBlockPath,
 }
@@ -119,6 +121,17 @@ const FROST_SLOW_MULTIPLIER: f32 = 0.5;
 const PROJECTILE_SPEED_CELLS_PER_SEC: f32 = 8.0;
 const PROJECTILE_HIT_DISTANCE_CELLS: f32 = 0.25;
 
+/// Gold economy balance numbers pending playtesting.
+const STARTING_GOLD: i32 = 200;
+const CANNON_PRICE: i32 = 100;
+const GATLING_PRICE: i32 = 80;
+const FROST_PRICE: i32 = 120;
+const GRUNT_GOLD_REWARD: i32 = 10;
+const RUNNER_GOLD_REWARD: i32 = 6;
+const TANK_GOLD_REWARD: i32 = 20;
+/// Fraction of the Gold spent on a Tower refunded on sale.
+const SELL_REFUND_FRACTION: f32 = 0.7;
+
 /// The three Enemy Kind, each with distinct Health/speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnemyKind {
@@ -141,6 +154,15 @@ impl EnemyKind {
             EnemyKind::Grunt => GRUNT_SPEED_CELLS_PER_SEC,
             EnemyKind::Runner => RUNNER_SPEED_CELLS_PER_SEC,
             EnemyKind::Tank => TANK_SPEED_CELLS_PER_SEC,
+        }
+    }
+
+    /// Gold granted to the player for killing this Enemy Kind.
+    fn gold_reward(self) -> i32 {
+        match self {
+            EnemyKind::Grunt => GRUNT_GOLD_REWARD,
+            EnemyKind::Runner => RUNNER_GOLD_REWARD,
+            EnemyKind::Tank => TANK_GOLD_REWARD,
         }
     }
 }
@@ -184,6 +206,15 @@ impl TowerKind {
     fn fires_projectiles(self) -> bool {
         !matches!(self, TowerKind::Frost)
     }
+
+    /// Gold cost to place a fresh Tower of this Kind.
+    fn price(self) -> i32 {
+        match self {
+            TowerKind::Cannon => CANNON_PRICE,
+            TowerKind::Gatling => GATLING_PRICE,
+            TowerKind::Frost => FROST_PRICE,
+        }
+    }
 }
 
 /// A single Enemy in transit between two Cell centers. `target` is
@@ -198,11 +229,13 @@ struct Enemy {
     kind: EnemyKind,
 }
 
-/// Per-Tower runtime state. Tier lands in ticket 07.
+/// Per-Tower runtime state. Tier lands in ticket 07 and will fold
+/// upgrade spend into `gold_spent` for the sell refund.
 #[derive(Debug, Clone, Copy)]
 struct TowerRuntime {
     kind: TowerKind,
     cooldown_remaining: f32,
+    gold_spent: i32,
 }
 
 /// A shot in flight, tracking the live Enemy's position every tick
@@ -243,6 +276,7 @@ pub struct Simulation {
     towers: HashMap<CellPos, TowerRuntime>,
     enemy: Option<Enemy>,
     projectiles: Vec<Projectile>,
+    gold: i32,
 }
 
 impl Simulation {
@@ -252,11 +286,16 @@ impl Simulation {
             towers: HashMap::new(),
             enemy: None,
             projectiles: Vec::new(),
+            gold: STARTING_GOLD,
         }
     }
 
     pub fn grid(&self) -> &Grid {
         &self.grid
+    }
+
+    pub fn gold(&self) -> i32 {
+        self.gold
     }
 
     pub fn has_tower(&self, pos: CellPos) -> bool {
@@ -282,13 +321,17 @@ impl Simulation {
         self.shortest_path(self.grid.spawn(), Some(pos))
     }
 
-    /// Whether a Tower could be placed at `pos` right now, and if not, why.
-    pub fn can_place(&self, pos: CellPos) -> Result<(), PlacementError> {
+    /// Whether a Tower of the given Kind could be placed at `pos` right
+    /// now, and if not, why.
+    pub fn can_place(&self, pos: CellPos, kind: TowerKind) -> Result<(), PlacementError> {
         if self.grid.kind_at(pos) != CellKind::Buildable {
             return Err(PlacementError::NotBuildable);
         }
         if self.towers.contains_key(&pos) {
             return Err(PlacementError::AlreadyOccupied);
+        }
+        if self.gold < kind.price() {
+            return Err(PlacementError::InsufficientGold);
         }
         if self.shortest_path(self.grid.spawn(), Some(pos)).is_none() {
             return Err(PlacementError::WouldBlockPath);
@@ -297,20 +340,31 @@ impl Simulation {
     }
 
     pub fn place_tower(&mut self, pos: CellPos, kind: TowerKind) -> Result<(), PlacementError> {
-        self.can_place(pos)?;
+        self.can_place(pos, kind)?;
+        let price = kind.price();
+        self.gold -= price;
         self.towers.insert(
             pos,
             TowerRuntime {
                 kind,
                 cooldown_remaining: 0.0,
+                gold_spent: price,
             },
         );
         Ok(())
     }
 
-    /// Removes the Tower at `pos`, if any. Returns whether a Tower was there.
+    /// Removes the Tower at `pos`, if any, refunding `SELL_REFUND_FRACTION`
+    /// of the Gold spent on it (purchase price only for now; upgrade
+    /// spend folds in from ticket 07). The refund rounds to the
+    /// nearest whole Gold, .5 rounding away from zero. Returns whether
+    /// a Tower was there.
     pub fn sell_tower(&mut self, pos: CellPos) -> bool {
-        self.towers.remove(&pos).is_some()
+        let Some(runtime) = self.towers.remove(&pos) else {
+            return false;
+        };
+        self.gold += (runtime.gold_spent as f32 * SELL_REFUND_FRACTION).round() as i32;
+        true
     }
 
     /// Spawns one Enemy of the given Kind at Spawn, replacing any
@@ -490,6 +544,7 @@ impl Simulation {
                 if let Some(enemy) = self.enemy.as_mut() {
                     enemy.health -= projectile.damage;
                     if enemy.health <= 0.0 {
+                        self.gold += enemy.kind.gold_reward();
                         self.enemy = None;
                     }
                 }
@@ -627,6 +682,9 @@ mod tests {
     #[test]
     fn sealing_the_entire_maze_is_rejected_but_a_single_gap_stays_valid() {
         let mut sim = Simulation::new();
+        // This test is about the Blocking Rule, not the Gold economy:
+        // give it enough Gold to place two dozen Towers regardless of price.
+        sim.gold = 100_000;
 
         // Wall off the whole column x=1 except one gap at y=24: Spawn
         // (x=0) can only reach the rest of the grid through column 1.
@@ -867,5 +925,65 @@ mod tests {
             slowed_progress < unslowed_progress - f32::EPSILON,
             "an Enemy within Frost Range should move slower than its base speed"
         );
+    }
+
+    #[test]
+    fn affordable_placement_deducts_the_towers_price() {
+        let mut sim = Simulation::new();
+        let starting_gold = sim.gold();
+
+        sim.place_tower(CellPos::new(5, 5), TowerKind::Cannon)
+            .expect("an uncritical Cell should be a legal placement");
+
+        assert_eq!(sim.gold(), starting_gold - TowerKind::Cannon.price());
+    }
+
+    #[test]
+    fn unaffordable_placement_is_rejected_and_gold_is_unchanged() {
+        let mut sim = Simulation::new();
+        sim.gold = TowerKind::Cannon.price() - 1;
+
+        assert_eq!(
+            sim.place_tower(CellPos::new(5, 5), TowerKind::Cannon),
+            Err(PlacementError::InsufficientGold)
+        );
+        assert_eq!(sim.gold(), TowerKind::Cannon.price() - 1);
+        assert!(!sim.has_tower(CellPos::new(5, 5)));
+    }
+
+    #[test]
+    fn each_enemy_kind_grants_its_own_distinct_kill_reward() {
+        assert_ne!(EnemyKind::Grunt.gold_reward(), EnemyKind::Runner.gold_reward());
+        assert_ne!(EnemyKind::Grunt.gold_reward(), EnemyKind::Tank.gold_reward());
+        assert_ne!(EnemyKind::Runner.gold_reward(), EnemyKind::Tank.gold_reward());
+    }
+
+    #[test]
+    fn killing_an_enemy_grants_its_kill_reward() {
+        let mut sim = sim_with_enemy_and_adjacent_tower();
+        let gold_before = sim.gold();
+
+        for _ in 0..300 {
+            sim.tick(0.01);
+            if !sim.enemy_alive() {
+                break;
+            }
+        }
+
+        assert!(!sim.enemy_alive());
+        assert_eq!(sim.gold(), gold_before + EnemyKind::Grunt.gold_reward());
+    }
+
+    #[test]
+    fn selling_a_tower_with_no_upgrades_refunds_seventy_percent_of_its_price_rounded() {
+        let mut sim = Simulation::new();
+        let pos = CellPos::new(5, 5);
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
+        let gold_after_buying = sim.gold();
+
+        assert!(sim.sell_tower(pos));
+
+        let expected_refund = (TowerKind::Cannon.price() as f32 * SELL_REFUND_FRACTION).round() as i32;
+        assert_eq!(sim.gold(), gold_after_buying + expected_refund);
     }
 }

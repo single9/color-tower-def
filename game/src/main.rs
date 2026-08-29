@@ -31,6 +31,7 @@ fn main() {
                 interact_with_grid,
                 move_enemy,
                 sync_projectiles,
+                sync_gold_text,
             )
                 .chain(),
         )
@@ -72,6 +73,10 @@ struct EnemyMarker;
 /// state every frame (mirrors `PathPreviewTile`'s approach).
 #[derive(Component)]
 struct ProjectileMarker;
+
+/// Marks the sidebar's live Gold readout text.
+#[derive(Component)]
+struct GoldText;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -164,7 +169,7 @@ fn spawn_grid(mut commands: Commands) {
     }
 }
 
-fn spawn_sidebar(mut commands: Commands) {
+fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
     commands
         .spawn(Node {
             width: Val::Px(SIDEBAR_PX),
@@ -180,8 +185,9 @@ fn spawn_sidebar(mut commands: Commands) {
         .insert(BackgroundColor(Color::srgb(0.12, 0.12, 0.14)))
         .with_children(|sidebar| {
             sidebar.spawn((
-                Text::new("Gold: -"),
+                Text::new(format!("Gold: {}", sim.0.gold())),
                 TextColor(Color::WHITE),
+                GoldText,
             ));
             sidebar.spawn((
                 Text::new("Lives: -"),
@@ -377,4 +383,12 @@ fn sync_projectiles(
             ProjectileMarker,
         ));
     }
+}
+
+/// Keeps the sidebar's Gold readout in sync with `simulation` state.
+fn sync_gold_text(sim: Res<SimState>, mut text: Query<&mut Text, With<GoldText>>) {
+    let Ok(mut text) = text.get_single_mut() else {
+        return;
+    };
+    text.0 = format!("Gold: {}", sim.0.gold());
 }
