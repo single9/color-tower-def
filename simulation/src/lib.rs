@@ -96,6 +96,8 @@ pub enum PlacementError {
     InsufficientGold,
     /// Placing here would leave no Path from Spawn to Goal (the Blocking Rule).
     WouldBlockPath,
+    /// The game has already ended in Victory or Defeat.
+    GameOver,
 }
 
 /// Balance numbers pending playtesting. Tier-scaling (ticket 07) and
@@ -288,6 +290,8 @@ pub enum UpgradeError {
     AlreadyMaxTier,
     /// The player does not have enough Gold for this upgrade step.
     InsufficientGold,
+    /// The game has already ended in Victory or Defeat.
+    GameOver,
 }
 
 /// A placed Tower's Kind, Tier, and current stats — for the Bevy
@@ -515,6 +519,9 @@ impl Simulation {
     /// Whether a Tower of the given Kind could be placed at `pos` right
     /// now, and if not, why.
     pub fn can_place(&self, pos: CellPos, kind: TowerKind) -> Result<(), PlacementError> {
+        if self.outcome.is_some() {
+            return Err(PlacementError::GameOver);
+        }
         if self.grid.kind_at(pos) != CellKind::Buildable {
             return Err(PlacementError::NotBuildable);
         }
@@ -550,6 +557,9 @@ impl Simulation {
     /// Upgrades the Tower at `pos` one Tier, if any and not already at
     /// the Tier 3 cap and the player can afford `upgrade_cost_at`.
     pub fn upgrade_tower(&mut self, pos: CellPos) -> Result<(), UpgradeError> {
+        if self.outcome.is_some() {
+            return Err(UpgradeError::GameOver);
+        }
         let Some(runtime) = self.towers.get(&pos) else {
             return Err(UpgradeError::NoTowerThere);
         };
@@ -573,6 +583,9 @@ impl Simulation {
     /// upgrade paid). The refund rounds to the nearest whole Gold, .5
     /// rounding away from zero. Returns whether a Tower was there.
     pub fn sell_tower(&mut self, pos: CellPos) -> bool {
+        if self.outcome.is_some() {
+            return false;
+        }
         let Some(runtime) = self.towers.remove(&pos) else {
             return false;
         };
@@ -1562,5 +1575,25 @@ mod tests {
             .any(|e| matches!(e, SimEvent::Victory | SimEvent::Defeat)));
         assert_eq!(sim.outcome(), None);
         assert_eq!(sim.wave_number(), 2);
+    }
+
+    #[test]
+    fn once_the_game_has_ended_placement_upgrade_sell_and_next_wave_all_reject() {
+        let mut sim = Simulation::new();
+        let pos = CellPos::new(5, 5);
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
+        sim.outcome = Some(GameOutcome::Defeat);
+
+        assert_eq!(
+            sim.place_tower(CellPos::new(6, 6), TowerKind::Cannon),
+            Err(PlacementError::GameOver)
+        );
+        assert_eq!(sim.upgrade_tower(pos), Err(UpgradeError::GameOver));
+        assert!(
+            !sim.sell_tower(pos),
+            "selling should be inert once the game has ended"
+        );
+        assert!(sim.has_tower(pos), "the Tower should be untouched by the rejected sell");
+        assert_eq!(sim.start_next_wave(), Err(WaveError::GameOver));
     }
 }

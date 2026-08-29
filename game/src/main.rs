@@ -1,7 +1,8 @@
 use bevy::color::palettes::css;
 use bevy::prelude::*;
 use simulation::{
-    CellKind, CellPos, EnemyKind, Grid, Simulation, TowerKind, TowerTier, CELL_SIZE_PX, GRID_SIZE,
+    CellKind, CellPos, EnemyKind, GameOutcome, Grid, Simulation, TowerKind, TowerTier,
+    CELL_SIZE_PX, GRID_SIZE,
 };
 
 const GRID_PX: f32 = CELL_SIZE_PX * GRID_SIZE as f32; // 500.0
@@ -23,7 +24,10 @@ fn main() {
         .insert_resource(SimState(Simulation::new()))
         .insert_resource(SelectedTowerKind(TowerKind::Cannon))
         .insert_resource(SelectedTower(None))
-        .add_systems(Startup, (spawn_camera, spawn_grid, spawn_sidebar))
+        .add_systems(
+            Startup,
+            (spawn_camera, spawn_grid, spawn_sidebar, spawn_result_overlay),
+        )
         .add_systems(
             Update,
             (
@@ -32,12 +36,14 @@ fn main() {
                 handle_tower_panel_buttons,
                 sync_tower_info_panel,
                 handle_wave_button,
+                handle_reset_button,
                 tick_simulation,
                 sync_enemies,
                 sync_projectiles,
                 sync_gold_text,
                 sync_lives_text,
                 sync_wave_ui,
+                sync_result_overlay,
             )
                 .chain(),
         )
@@ -114,6 +120,15 @@ struct UpgradeButton;
 /// The Sell button inside the Tower info panel.
 #[derive(Component)]
 struct SellButton;
+
+/// Full-window container the Victory/Defeat result overlay is
+/// rebuilt into whenever `simulation`'s outcome changes.
+#[derive(Component)]
+struct ResultOverlayRoot;
+
+/// The result overlay's "Reset" button.
+#[derive(Component)]
+struct ResetButton;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -342,6 +357,11 @@ fn interact_with_grid(
 ) {
     for entity in &preview_tiles {
         commands.entity(entity).despawn();
+    }
+
+    if sim.0.outcome().is_some() {
+        // The result overlay is showing: no Grid click has any effect.
+        return;
     }
 
     let Ok(window) = windows.get_single() else {
@@ -632,5 +652,123 @@ fn sync_wave_ui(
         } else {
             Color::srgb(0.2, 0.35, 0.2)
         });
+    }
+}
+
+/// Spawns the (initially empty) full-window container the result
+/// overlay is rebuilt into once Victory or Defeat fires.
+fn spawn_result_overlay(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            position_type: PositionType::Absolute,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        ResultOverlayRoot,
+    ));
+}
+
+/// Rebuilds the result overlay whenever `simulation`'s outcome
+/// changes: empty (and transparent) while the game is in progress,
+/// a dimming backdrop plus a Victory/Defeat panel and Reset button
+/// the instant it ends.
+fn sync_result_overlay(
+    mut commands: Commands,
+    sim: Res<SimState>,
+    root: Query<Entity, With<ResultOverlayRoot>>,
+    children: Query<&Children>,
+    mut last_rendered: Local<Option<GameOutcome>>,
+) {
+    let Ok(root) = root.get_single() else {
+        return;
+    };
+
+    let current = sim.0.outcome();
+    if current == *last_rendered {
+        return;
+    }
+    *last_rendered = current;
+
+    if let Ok(existing_children) = children.get(root) {
+        for &child in existing_children {
+            commands.entity(child).despawn_recursive();
+        }
+    }
+
+    let Some(outcome) = current else {
+        commands.entity(root).remove::<BackgroundColor>();
+        return;
+    };
+
+    commands
+        .entity(root)
+        .insert(BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.75)));
+    commands.entity(root).with_children(|overlay| {
+        overlay
+            .spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(16.0),
+                    padding: UiRect::all(Val::Px(24.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.15, 0.15, 0.18)),
+            ))
+            .with_children(|panel| {
+                let (label, color) = match outcome {
+                    GameOutcome::Victory => ("Victory!", Color::Srgba(css::LIME)),
+                    GameOutcome::Defeat => ("Defeat", Color::Srgba(css::RED)),
+                };
+                panel.spawn((Text::new(label), TextColor(color)));
+                panel
+                    .spawn((
+                        Button,
+                        Node {
+                            padding: UiRect::all(Val::Px(10.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                        ResetButton,
+                    ))
+                    .with_children(|button| {
+                        button.spawn((Text::new("Reset"), TextColor(Color::WHITE)));
+                    });
+            });
+    });
+}
+
+/// Resets to a completely fresh game, equivalent to a cold app
+/// launch: a new `Simulation` (empty Grid, starting Gold/Lives, Wave
+/// counter before Wave 1), plus every Tower/Enemy/Projectile sprite
+/// and UI selection state cleared.
+fn handle_reset_button(
+    mut commands: Commands,
+    mut sim: ResMut<SimState>,
+    mut selected_tower: ResMut<SelectedTower>,
+    mut selected_kind: ResMut<SelectedTowerKind>,
+    interactions: Query<&Interaction, (With<ResetButton>, Changed<Interaction>)>,
+    towers: Query<Entity, With<TowerAt>>,
+    enemies: Query<Entity, With<EnemyMarker>>,
+    projectiles: Query<Entity, With<ProjectileMarker>>,
+) {
+    for interaction in &interactions {
+        if *interaction == Interaction::Pressed {
+            sim.0 = Simulation::new();
+            selected_tower.0 = None;
+            selected_kind.0 = TowerKind::Cannon;
+            for entity in &towers {
+                commands.entity(entity).despawn();
+            }
+            for entity in &enemies {
+                commands.entity(entity).despawn();
+            }
+            for entity in &projectiles {
+                commands.entity(entity).despawn();
+            }
+        }
     }
 }
