@@ -23,7 +23,10 @@ fn main() {
             Startup,
             (spawn_camera, spawn_grid, spawn_sidebar, spawn_enemy),
         )
-        .add_systems(Update, (interact_with_grid, move_enemy))
+        .add_systems(
+            Update,
+            (interact_with_grid, move_enemy, sync_projectiles).chain(),
+        )
         .run();
 }
 
@@ -47,19 +50,32 @@ struct PathPreviewTile;
 #[derive(Component)]
 struct EnemyMarker;
 
+/// Marks a Projectile sprite, cleared and redrawn from `simulation`
+/// state every frame (mirrors `PathPreviewTile`'s approach).
+#[derive(Component)]
+struct ProjectileMarker;
+
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
 }
 
-/// World position of a Cell's center. The grid occupies the left
-/// `GRID_PX` x `GRID_PX` square of the window; the origin (0,0) in
-/// Bevy 2D world space is the center of the window.
-fn cell_world_pos(pos: CellPos) -> Vec3 {
+/// World position for a point given in Cell units (fractional units
+/// allowed, e.g. a Projectile's `simulation`-side position). The grid
+/// occupies the left `GRID_PX` x `GRID_PX` square of the window; the
+/// origin (0,0) in Bevy 2D world space is the center of the window.
+fn cell_units_to_world(x: f32, y: f32) -> Vec3 {
     let left_edge = -WINDOW_WIDTH / 2.0;
     let bottom_edge = -WINDOW_HEIGHT / 2.0;
-    let x = left_edge + pos.x as f32 * CELL_SIZE_PX + CELL_SIZE_PX / 2.0;
-    let y = bottom_edge + pos.y as f32 * CELL_SIZE_PX + CELL_SIZE_PX / 2.0;
-    Vec3::new(x, y, 0.0)
+    Vec3::new(
+        left_edge + x * CELL_SIZE_PX + CELL_SIZE_PX / 2.0,
+        bottom_edge + y * CELL_SIZE_PX + CELL_SIZE_PX / 2.0,
+        0.0,
+    )
+}
+
+/// World position of a Cell's center.
+fn cell_world_pos(pos: CellPos) -> Vec3 {
+    cell_units_to_world(pos.x as f32, pos.y as f32)
 }
 
 /// Inverse of `cell_world_pos`: which Cell (if any) a world position
@@ -89,6 +105,10 @@ fn path_preview_color() -> Color {
 
 fn enemy_color() -> Color {
     Color::Srgba(css::LIME) // Grunt; other Enemy Kind land in ticket 05
+}
+
+fn projectile_color() -> Color {
+    Color::Srgba(css::WHITE)
 }
 
 fn cell_color(kind: CellKind) -> Color {
@@ -276,5 +296,31 @@ fn move_enemy(
             transform.translation = from.lerp(to, transit.progress).with_z(2.0);
         }
         None => commands.entity(entity).despawn(),
+    }
+}
+
+/// Redraws every in-flight Projectile from `simulation` state, mirroring
+/// the Path-preview approach: clear last frame's sprites, respawn fresh
+/// ones at this frame's positions. `simulation::Simulation::tick`
+/// (called by `move_enemy`, which runs first in this chain) already
+/// owns all Tower-firing and Projectile-flight/impact logic.
+fn sync_projectiles(
+    mut commands: Commands,
+    sim: Res<SimState>,
+    existing: Query<Entity, With<ProjectileMarker>>,
+) {
+    for entity in &existing {
+        commands.entity(entity).despawn();
+    }
+    for (x, y) in sim.0.projectile_positions() {
+        commands.spawn((
+            Sprite {
+                color: projectile_color(),
+                custom_size: Some(Vec2::splat(CELL_SIZE_PX * 0.3)),
+                ..default()
+            },
+            Transform::from_translation(cell_units_to_world(x, y).with_z(1.5)),
+            ProjectileMarker,
+        ));
     }
 }

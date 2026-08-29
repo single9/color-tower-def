@@ -4,11 +4,16 @@
 
 **Blocked by:** 03 (A single Enemy walks the Path, reacting to live maze edits)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] A placed Cannon Tower fires a visible Projectile at the Enemy once it enters Range
-- [ ] The Projectile visibly tracks the Enemy's movement rather than flying in a straight fixed line
-- [ ] On hit, the Enemy's Health decreases by the Tower's damage amount and the Projectile despawns
-- [ ] An Enemy whose Health reaches zero despawns immediately, before it can reach the Goal
-- [ ] A Projectile whose target dies before arrival despawns cleanly with no error and no effect on any other Enemy
-- [ ] `simulation` unit tests cover: a hit applies damage and removes the Projectile; Health reaching zero kills the Enemy; a Projectile targeting an already-dead Enemy is a no-op
+- [x] A placed Cannon Tower fires a visible Projectile at the Enemy once it enters Range
+- [x] The Projectile visibly tracks the Enemy's movement rather than flying in a straight fixed line
+- [x] On hit, the Enemy's Health decreases by the Tower's damage amount and the Projectile despawns
+- [x] An Enemy whose Health reaches zero despawns immediately, before it can reach the Goal
+- [x] A Projectile whose target dies before arrival despawns cleanly with no error and no effect on any other Enemy
+- [x] `simulation` unit tests cover: a hit applies damage and removes the Projectile; Health reaching zero kills the Enemy; a Projectile targeting an already-dead Enemy is a no-op
+
+## Verification
+
+- `cargo test --workspace`: 15/15 `simulation` unit tests pass (3 new: hit applies damage and removes the Projectile, two hits kill the Grunt, a Projectile whose target died mid-flight is cleared without panic or effect).
+- Manually driven end-to-end via synthetic X11 input against the running Bevy window (screenshots inspected): a placed Cannon visibly fires a white Projectile that tracks the moving Enemy (not a straight line to a fixed point); a hit removes the Projectile; two hits kill the Enemy, which despawns a couple of Cells from Spawn — well short of Goal.

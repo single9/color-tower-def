@@ -101,14 +101,45 @@ pub enum PlacementError {
 /// land in ticket 05.
 const ENEMY_SPEED_CELLS_PER_SEC: f32 = 2.0;
 
+/// Placeholder Grunt/Cannon/Projectile balance numbers pending
+/// playtesting; Enemy Kind/Tower Kind-specific values land in ticket 05.
+const GRUNT_HEALTH: f32 = 100.0;
+const CANNON_DAMAGE: f32 = 50.0;
+const CANNON_RANGE_CELLS: f32 = 5.0;
+const CANNON_COOLDOWN_SECONDS: f32 = 1.0;
+const PROJECTILE_SPEED_CELLS_PER_SEC: f32 = 8.0;
+const PROJECTILE_HIT_DISTANCE_CELLS: f32 = 0.25;
+
 /// A single Enemy in transit between two Cell centers. `target` is
 /// `None` only in the rare case its onward Path vanished entirely
-/// (see `Simulation::tick`).
+/// (see `Simulation::tick_enemy_movement`).
 #[derive(Debug, Clone, Copy)]
 struct Enemy {
     at: CellPos,
     target: Option<CellPos>,
     progress: f32,
+    health: f32,
+}
+
+/// Per-Tower runtime state. Ticket 04 only needs a fire cooldown;
+/// Tier lands in ticket 07.
+#[derive(Debug, Clone, Copy)]
+struct TowerRuntime {
+    cooldown_remaining: f32,
+}
+
+/// A Cannon shot in flight, tracking the live Enemy's position every
+/// tick (ADR-0001: plain distance check, no physics engine). Position
+/// is in Cell units, not pixels — the Bevy layer converts.
+#[derive(Debug, Clone, Copy)]
+struct Projectile {
+    pos: (f32, f32),
+}
+
+fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    (dx * dx + dy * dy).sqrt()
 }
 
 /// Where an Enemy currently is, for the Bevy layer to render: it sits
@@ -129,16 +160,18 @@ pub struct EnemyTransit {
 #[derive(Debug, Clone)]
 pub struct Simulation {
     grid: Grid,
-    towers: HashSet<CellPos>,
+    towers: HashMap<CellPos, TowerRuntime>,
     enemy: Option<Enemy>,
+    projectiles: Vec<Projectile>,
 }
 
 impl Simulation {
     pub fn new() -> Self {
         Self {
             grid: Grid::new(),
-            towers: HashSet::new(),
+            towers: HashMap::new(),
             enemy: None,
+            projectiles: Vec::new(),
         }
     }
 
@@ -147,7 +180,7 @@ impl Simulation {
     }
 
     pub fn has_tower(&self, pos: CellPos) -> bool {
-        self.towers.contains(&pos)
+        self.towers.contains_key(&pos)
     }
 
     /// The current shortest Path from Spawn to Goal around all placed
@@ -168,7 +201,7 @@ impl Simulation {
         if self.grid.kind_at(pos) != CellKind::Buildable {
             return Err(PlacementError::NotBuildable);
         }
-        if self.towers.contains(&pos) {
+        if self.towers.contains_key(&pos) {
             return Err(PlacementError::AlreadyOccupied);
         }
         if self.shortest_path(self.grid.spawn(), Some(pos)).is_none() {
@@ -179,13 +212,18 @@ impl Simulation {
 
     pub fn place_tower(&mut self, pos: CellPos) -> Result<(), PlacementError> {
         self.can_place(pos)?;
-        self.towers.insert(pos);
+        self.towers.insert(
+            pos,
+            TowerRuntime {
+                cooldown_remaining: 0.0,
+            },
+        );
         Ok(())
     }
 
     /// Removes the Tower at `pos`, if any. Returns whether a Tower was there.
     pub fn sell_tower(&mut self, pos: CellPos) -> bool {
-        self.towers.remove(&pos)
+        self.towers.remove(&pos).is_some()
     }
 
     /// Spawns one Grunt-stat Enemy at Spawn, replacing any Enemy
@@ -198,11 +236,26 @@ impl Simulation {
             at: spawn,
             target: path.and_then(|p| p.get(1).copied()),
             progress: 0.0,
+            health: GRUNT_HEALTH,
         });
     }
 
     pub fn enemy_alive(&self) -> bool {
         self.enemy.is_some()
+    }
+
+    pub fn enemy_health(&self) -> Option<f32> {
+        self.enemy.as_ref().map(|e| e.health)
+    }
+
+    pub fn projectile_count(&self) -> usize {
+        self.projectiles.len()
+    }
+
+    /// Every Projectile's current position, in Cell units, for the
+    /// Bevy layer to render.
+    pub fn projectile_positions(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
+        self.projectiles.iter().map(|p| p.pos)
     }
 
     /// The live Enemy's current transit segment (where it's coming
@@ -217,11 +270,19 @@ impl Simulation {
         })
     }
 
+    /// Advances the whole Simulation by `dt` seconds: Enemy movement,
+    /// then Tower firing, then Projectile flight/impact.
+    pub fn tick(&mut self, dt: f32) {
+        self.tick_enemy_movement(dt);
+        self.tick_towers(dt);
+        self.tick_projectiles(dt);
+    }
+
     /// Advances the live Enemy by `dt` seconds. Per ADR-0002, the
     /// Enemy's Path is only ever recomputed the instant it reaches a
     /// Cell center — never mid-transit, no matter how the Grid changes
     /// underneath it in the meantime.
-    pub fn tick(&mut self, dt: f32) {
+    fn tick_enemy_movement(&mut self, dt: f32) {
         let Some((at, target, mut progress)) = self
             .enemy
             .as_ref()
@@ -258,13 +319,86 @@ impl Simulation {
         enemy.target = new_target;
     }
 
+    /// Where the live Enemy currently sits, in Cell units, interpolated
+    /// between its current transit segment's two Cell centers.
+    fn enemy_position_cells(&self) -> Option<(f32, f32)> {
+        self.enemy_transit().map(|t| {
+            let (fx, fy) = (t.from.x as f32, t.from.y as f32);
+            let (tx, ty) = (t.to.x as f32, t.to.y as f32);
+            (fx + (tx - fx) * t.progress, fy + (ty - fy) * t.progress)
+        })
+    }
+
+    /// Ticks down every Tower's cooldown and fires a Projectile from
+    /// any Tower that's ready and has the Enemy within Range.
+    fn tick_towers(&mut self, dt: f32) {
+        let Some(enemy_pos) = self.enemy_position_cells() else {
+            return;
+        };
+
+        let positions: Vec<CellPos> = self.towers.keys().copied().collect();
+        for pos in positions {
+            let runtime = self.towers.get_mut(&pos).unwrap();
+            runtime.cooldown_remaining -= dt;
+            if runtime.cooldown_remaining > 0.0 {
+                continue;
+            }
+
+            let tower_pos = (pos.x as f32, pos.y as f32);
+            if distance(tower_pos, enemy_pos) <= CANNON_RANGE_CELLS {
+                runtime.cooldown_remaining = CANNON_COOLDOWN_SECONDS;
+                self.projectiles.push(Projectile { pos: tower_pos });
+            }
+        }
+    }
+
+    /// Moves every Projectile toward the live Enemy's current position
+    /// and resolves hits (ADR-0001: plain distance check). A
+    /// Projectile whose target has died — from this hit or an earlier
+    /// one this same tick — despawns without effect.
+    fn tick_projectiles(&mut self, dt: f32) {
+        let Some(enemy_pos) = self.enemy_position_cells() else {
+            self.projectiles.clear();
+            return;
+        };
+
+        let in_flight = std::mem::take(&mut self.projectiles);
+        let mut remaining = Vec::with_capacity(in_flight.len());
+        for mut projectile in in_flight {
+            if self.enemy.is_none() {
+                continue;
+            }
+
+            if distance(projectile.pos, enemy_pos) <= PROJECTILE_HIT_DISTANCE_CELLS {
+                if let Some(enemy) = self.enemy.as_mut() {
+                    enemy.health -= CANNON_DAMAGE;
+                    if enemy.health <= 0.0 {
+                        self.enemy = None;
+                    }
+                }
+                continue;
+            }
+
+            let dx = enemy_pos.0 - projectile.pos.0;
+            let dy = enemy_pos.1 - projectile.pos.1;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let step = PROJECTILE_SPEED_CELLS_PER_SEC * dt;
+            if dist > f32::EPSILON {
+                projectile.pos.0 += dx / dist * step;
+                projectile.pos.1 += dy / dist * step;
+            }
+            remaining.push(projectile);
+        }
+        self.projectiles = remaining;
+    }
+
     /// BFS from `from` to Goal, treating every placed Tower — plus
     /// `extra_blocked`, if given — as impassable. `from` need not be
     /// Spawn: each Enemy recomputes its own remaining Path from
     /// wherever it currently stands (see ADR-0002).
     fn shortest_path(&self, from: CellPos, extra_blocked: Option<CellPos>) -> Option<Vec<CellPos>> {
         let goal = self.grid.goal();
-        let is_blocked = |pos: CellPos| Some(pos) == extra_blocked || self.towers.contains(&pos);
+        let is_blocked = |pos: CellPos| Some(pos) == extra_blocked || self.towers.contains_key(&pos);
 
         if is_blocked(from) || is_blocked(goal) {
             return None;
@@ -481,5 +615,78 @@ mod tests {
 
         assert!(!sim.enemy_alive());
         assert!(sim.enemy_transit().is_none());
+    }
+
+    /// Places a Cannon one Cell above Spawn (never on the straight
+    /// row-12 Path, so it never diverts the Enemy) and within Range of
+    /// it from the very first tick, so hit timing doesn't depend on
+    /// how far the Enemy has walked.
+    fn sim_with_enemy_and_adjacent_tower() -> Simulation {
+        let mut sim = Simulation::new();
+        let spawn = sim.grid().spawn();
+        sim.place_tower(CellPos::new(spawn.x, spawn.y + 1))
+            .expect("a Tower one Cell above Spawn should be a legal, non-blocking placement");
+        sim.spawn_enemy();
+        sim
+    }
+
+    #[test]
+    fn a_hit_applies_damage_and_removes_the_projectile() {
+        let mut sim = sim_with_enemy_and_adjacent_tower();
+
+        let mut hit = false;
+        for _ in 0..200 {
+            sim.tick(0.01);
+            if sim.enemy_health() != Some(GRUNT_HEALTH) {
+                hit = true;
+                break;
+            }
+        }
+
+        assert!(hit, "the Cannon should land a hit well within 2 seconds");
+        assert_eq!(sim.enemy_health(), Some(GRUNT_HEALTH - CANNON_DAMAGE));
+        assert_eq!(
+            sim.projectile_count(),
+            0,
+            "the Projectile that just hit should be gone"
+        );
+    }
+
+    #[test]
+    fn health_reaching_zero_kills_the_enemy() {
+        let mut sim = sim_with_enemy_and_adjacent_tower();
+
+        for _ in 0..300 {
+            sim.tick(0.01);
+            if !sim.enemy_alive() {
+                break;
+            }
+        }
+
+        assert!(
+            !sim.enemy_alive(),
+            "two Cannon hits (100 Health, 50 damage each) should kill the Grunt"
+        );
+        assert!(sim.enemy_transit().is_none());
+    }
+
+    #[test]
+    fn a_projectile_targeting_an_already_dead_enemy_is_a_no_op() {
+        let mut sim = sim_with_enemy_and_adjacent_tower();
+
+        // One small tick: the Cannon (cooldown starts at 0, Enemy
+        // already in Range) fires, but the Projectile hasn't arrived yet.
+        sim.tick(0.01);
+        assert_eq!(sim.projectile_count(), 1);
+
+        // The Enemy dies from something else entirely before the
+        // in-flight Projectile reaches it.
+        sim.enemy = None;
+
+        // Advancing further must not panic, must clear the now-orphaned
+        // Projectile, and must not resurrect or otherwise affect anything.
+        sim.tick(0.5);
+        assert_eq!(sim.projectile_count(), 0);
+        assert!(!sim.enemy_alive());
     }
 }
