@@ -96,19 +96,95 @@ pub enum PlacementError {
     WouldBlockPath,
 }
 
-/// How many Cell-widths a Grunt-stat Enemy crosses per second. A
-/// placeholder value pending playtesting; Enemy Kind-specific speeds
-/// land in ticket 05.
-const ENEMY_SPEED_CELLS_PER_SEC: f32 = 2.0;
-
-/// Placeholder Grunt/Cannon/Projectile balance numbers pending
-/// playtesting; Enemy Kind/Tower Kind-specific values land in ticket 05.
+/// Balance numbers pending playtesting. Tier-scaling (ticket 07) and
+/// Wave-scaling (ticket 08) land later; these are the base values.
 const GRUNT_HEALTH: f32 = 100.0;
+const GRUNT_SPEED_CELLS_PER_SEC: f32 = 2.0;
+const RUNNER_HEALTH: f32 = 50.0;
+const RUNNER_SPEED_CELLS_PER_SEC: f32 = 3.5;
+const TANK_HEALTH: f32 = 220.0;
+const TANK_SPEED_CELLS_PER_SEC: f32 = 1.0;
+
 const CANNON_DAMAGE: f32 = 50.0;
 const CANNON_RANGE_CELLS: f32 = 5.0;
 const CANNON_COOLDOWN_SECONDS: f32 = 1.0;
+const GATLING_DAMAGE: f32 = 15.0;
+const GATLING_RANGE_CELLS: f32 = 4.0;
+const GATLING_COOLDOWN_SECONDS: f32 = 0.25;
+const FROST_RANGE_CELLS: f32 = 3.5;
+/// Fraction of normal speed an Enemy moves at while inside a Frost
+/// Tower's Range (re-evaluated every tick; no lingering effect).
+const FROST_SLOW_MULTIPLIER: f32 = 0.5;
+
 const PROJECTILE_SPEED_CELLS_PER_SEC: f32 = 8.0;
 const PROJECTILE_HIT_DISTANCE_CELLS: f32 = 0.25;
+
+/// The three Enemy Kind, each with distinct Health/speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnemyKind {
+    Grunt,
+    Runner,
+    Tank,
+}
+
+impl EnemyKind {
+    fn health(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => GRUNT_HEALTH,
+            EnemyKind::Runner => RUNNER_HEALTH,
+            EnemyKind::Tank => TANK_HEALTH,
+        }
+    }
+
+    fn speed(self) -> f32 {
+        match self {
+            EnemyKind::Grunt => GRUNT_SPEED_CELLS_PER_SEC,
+            EnemyKind::Runner => RUNNER_SPEED_CELLS_PER_SEC,
+            EnemyKind::Tank => TANK_SPEED_CELLS_PER_SEC,
+        }
+    }
+}
+
+/// The three Tower Kind. Cannon and Gatling both fire tracking
+/// Projectiles (ADR-0001) at different damage/fire-rate tradeoffs;
+/// Frost fires none, instead continuously slowing every Enemy inside
+/// its Range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TowerKind {
+    Cannon,
+    Gatling,
+    Frost,
+}
+
+impl TowerKind {
+    fn damage(self) -> f32 {
+        match self {
+            TowerKind::Cannon => CANNON_DAMAGE,
+            TowerKind::Gatling => GATLING_DAMAGE,
+            TowerKind::Frost => 0.0,
+        }
+    }
+
+    fn range(self) -> f32 {
+        match self {
+            TowerKind::Cannon => CANNON_RANGE_CELLS,
+            TowerKind::Gatling => GATLING_RANGE_CELLS,
+            TowerKind::Frost => FROST_RANGE_CELLS,
+        }
+    }
+
+    fn cooldown(self) -> f32 {
+        match self {
+            TowerKind::Cannon => CANNON_COOLDOWN_SECONDS,
+            TowerKind::Gatling => GATLING_COOLDOWN_SECONDS,
+            TowerKind::Frost => 0.0,
+        }
+    }
+
+    fn fires_projectiles(self) -> bool {
+        !matches!(self, TowerKind::Frost)
+    }
+}
 
 /// A single Enemy in transit between two Cell centers. `target` is
 /// `None` only in the rare case its onward Path vanished entirely
@@ -119,21 +195,25 @@ struct Enemy {
     target: Option<CellPos>,
     progress: f32,
     health: f32,
+    kind: EnemyKind,
 }
 
-/// Per-Tower runtime state. Ticket 04 only needs a fire cooldown;
-/// Tier lands in ticket 07.
+/// Per-Tower runtime state. Tier lands in ticket 07.
 #[derive(Debug, Clone, Copy)]
 struct TowerRuntime {
+    kind: TowerKind,
     cooldown_remaining: f32,
 }
 
-/// A Cannon shot in flight, tracking the live Enemy's position every
-/// tick (ADR-0001: plain distance check, no physics engine). Position
-/// is in Cell units, not pixels — the Bevy layer converts.
+/// A shot in flight, tracking the live Enemy's position every tick
+/// (ADR-0001: plain distance check, no physics engine). Position is
+/// in Cell units, not pixels — the Bevy layer converts. `damage`
+/// carries the firing Tower Kind's damage so Gatling and Cannon
+/// shots resolve differently on hit.
 #[derive(Debug, Clone, Copy)]
 struct Projectile {
     pos: (f32, f32),
+    damage: f32,
 }
 
 fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -183,6 +263,12 @@ impl Simulation {
         self.towers.contains_key(&pos)
     }
 
+    /// The Tower Kind placed at `pos`, if any — for the Bevy layer to
+    /// pick a sprite color.
+    pub fn tower_kind_at(&self, pos: CellPos) -> Option<TowerKind> {
+        self.towers.get(&pos).map(|runtime| runtime.kind)
+    }
+
     /// The current shortest Path from Spawn to Goal around all placed
     /// Tower, or `None` if none exists.
     pub fn current_path(&self) -> Option<Vec<CellPos>> {
@@ -210,11 +296,12 @@ impl Simulation {
         Ok(())
     }
 
-    pub fn place_tower(&mut self, pos: CellPos) -> Result<(), PlacementError> {
+    pub fn place_tower(&mut self, pos: CellPos, kind: TowerKind) -> Result<(), PlacementError> {
         self.can_place(pos)?;
         self.towers.insert(
             pos,
             TowerRuntime {
+                kind,
                 cooldown_remaining: 0.0,
             },
         );
@@ -226,17 +313,18 @@ impl Simulation {
         self.towers.remove(&pos).is_some()
     }
 
-    /// Spawns one Grunt-stat Enemy at Spawn, replacing any Enemy
-    /// already present. Ticket 03 only needs a single Enemy; Wave
-    /// spawning of many at once lands in ticket 08.
-    pub fn spawn_enemy(&mut self) {
+    /// Spawns one Enemy of the given Kind at Spawn, replacing any
+    /// Enemy already present. Ticket 05 only needs a single Enemy on
+    /// screen; Wave spawning of many at once lands in ticket 08.
+    pub fn spawn_enemy(&mut self, kind: EnemyKind) {
         let spawn = self.grid.spawn();
         let path = self.shortest_path(spawn, None);
         self.enemy = Some(Enemy {
             at: spawn,
             target: path.and_then(|p| p.get(1).copied()),
             progress: 0.0,
-            health: GRUNT_HEALTH,
+            health: kind.health(),
+            kind,
         });
     }
 
@@ -270,23 +358,44 @@ impl Simulation {
         })
     }
 
-    /// Advances the whole Simulation by `dt` seconds: Enemy movement,
-    /// then Tower firing, then Projectile flight/impact.
+    /// Advances the whole Simulation by `dt` seconds: Enemy movement
+    /// (at whatever speed the current Frost coverage allows), then
+    /// Tower firing, then Projectile flight/impact.
     pub fn tick(&mut self, dt: f32) {
-        self.tick_enemy_movement(dt);
+        let slow_multiplier = self.frost_slow_multiplier();
+        self.tick_enemy_movement(dt, slow_multiplier);
         self.tick_towers(dt);
         self.tick_projectiles(dt);
     }
 
-    /// Advances the live Enemy by `dt` seconds. Per ADR-0002, the
+    /// Whether the live Enemy's current position falls within any
+    /// Frost Tower's Range right now. Re-evaluated fresh every tick —
+    /// no lingering effect once the Enemy steps back outside.
+    fn frost_slow_multiplier(&self) -> f32 {
+        let Some(enemy_pos) = self.enemy_position_cells() else {
+            return 1.0;
+        };
+        let in_frost = self.towers.iter().any(|(pos, runtime)| {
+            runtime.kind == TowerKind::Frost
+                && distance((pos.x as f32, pos.y as f32), enemy_pos) <= runtime.kind.range()
+        });
+        if in_frost {
+            FROST_SLOW_MULTIPLIER
+        } else {
+            1.0
+        }
+    }
+
+    /// Advances the live Enemy by `dt` seconds at its Kind's base
+    /// speed times `speed_multiplier` (Frost slow). Per ADR-0002, the
     /// Enemy's Path is only ever recomputed the instant it reaches a
     /// Cell center — never mid-transit, no matter how the Grid changes
     /// underneath it in the meantime.
-    fn tick_enemy_movement(&mut self, dt: f32) {
-        let Some((at, target, mut progress)) = self
+    fn tick_enemy_movement(&mut self, dt: f32, speed_multiplier: f32) {
+        let Some((at, target, mut progress, kind)) = self
             .enemy
             .as_ref()
-            .map(|enemy| (enemy.at, enemy.target, enemy.progress))
+            .map(|enemy| (enemy.at, enemy.target, enemy.progress, enemy.kind))
         else {
             return;
         };
@@ -299,7 +408,7 @@ impl Simulation {
             return;
         };
 
-        progress += dt * ENEMY_SPEED_CELLS_PER_SEC;
+        progress += dt * kind.speed() * speed_multiplier;
         if progress < 1.0 {
             self.enemy.as_mut().unwrap().progress = progress;
             return;
@@ -329,8 +438,10 @@ impl Simulation {
         })
     }
 
-    /// Ticks down every Tower's cooldown and fires a Projectile from
-    /// any Tower that's ready and has the Enemy within Range.
+    /// Ticks down every projectile-firing Tower's cooldown and fires a
+    /// Projectile from any that's ready and has the Enemy within
+    /// Range. Frost Towers never fire — their slow is applied directly
+    /// in `tick`, not through this pipeline.
     fn tick_towers(&mut self, dt: f32) {
         let Some(enemy_pos) = self.enemy_position_cells() else {
             return;
@@ -339,15 +450,21 @@ impl Simulation {
         let positions: Vec<CellPos> = self.towers.keys().copied().collect();
         for pos in positions {
             let runtime = self.towers.get_mut(&pos).unwrap();
+            if !runtime.kind.fires_projectiles() {
+                continue;
+            }
             runtime.cooldown_remaining -= dt;
             if runtime.cooldown_remaining > 0.0 {
                 continue;
             }
 
             let tower_pos = (pos.x as f32, pos.y as f32);
-            if distance(tower_pos, enemy_pos) <= CANNON_RANGE_CELLS {
-                runtime.cooldown_remaining = CANNON_COOLDOWN_SECONDS;
-                self.projectiles.push(Projectile { pos: tower_pos });
+            if distance(tower_pos, enemy_pos) <= runtime.kind.range() {
+                runtime.cooldown_remaining = runtime.kind.cooldown();
+                self.projectiles.push(Projectile {
+                    pos: tower_pos,
+                    damage: runtime.kind.damage(),
+                });
             }
         }
     }
@@ -371,7 +488,7 @@ impl Simulation {
 
             if distance(projectile.pos, enemy_pos) <= PROJECTILE_HIT_DISTANCE_CELLS {
                 if let Some(enemy) = self.enemy.as_mut() {
-                    enemy.health -= CANNON_DAMAGE;
+                    enemy.health -= projectile.damage;
                     if enemy.health <= 0.0 {
                         self.enemy = None;
                     }
@@ -479,7 +596,7 @@ mod tests {
     #[test]
     fn placing_on_an_uncritical_cell_succeeds() {
         let mut sim = Simulation::new();
-        assert!(sim.place_tower(CellPos::new(5, 5)).is_ok());
+        assert!(sim.place_tower(CellPos::new(5, 5), TowerKind::Cannon).is_ok());
         assert!(sim.has_tower(CellPos::new(5, 5)));
     }
 
@@ -487,11 +604,11 @@ mod tests {
     fn placing_on_spawn_or_goal_is_rejected() {
         let mut sim = Simulation::new();
         assert_eq!(
-            sim.place_tower(sim.grid().spawn()),
+            sim.place_tower(sim.grid().spawn(), TowerKind::Cannon),
             Err(PlacementError::NotBuildable)
         );
         assert_eq!(
-            sim.place_tower(sim.grid().goal()),
+            sim.place_tower(sim.grid().goal(), TowerKind::Cannon),
             Err(PlacementError::NotBuildable)
         );
     }
@@ -500,9 +617,9 @@ mod tests {
     fn placing_on_an_already_occupied_cell_is_rejected() {
         let mut sim = Simulation::new();
         let pos = CellPos::new(5, 5);
-        sim.place_tower(pos).unwrap();
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
         assert_eq!(
-            sim.place_tower(pos),
+            sim.place_tower(pos, TowerKind::Cannon),
             Err(PlacementError::AlreadyOccupied)
         );
     }
@@ -514,7 +631,7 @@ mod tests {
         // Wall off the whole column x=1 except one gap at y=24: Spawn
         // (x=0) can only reach the rest of the grid through column 1.
         for y in 0..GRID_SIZE - 1 {
-            sim.place_tower(CellPos::new(1, y))
+            sim.place_tower(CellPos::new(1, y), TowerKind::Cannon)
                 .expect("leaving a gap open should keep placement valid");
         }
 
@@ -525,7 +642,7 @@ mod tests {
         // Sealing the last gap would cut Spawn off from Goal entirely.
         let last_gap = CellPos::new(1, GRID_SIZE - 1);
         assert_eq!(
-            sim.place_tower(last_gap),
+            sim.place_tower(last_gap, TowerKind::Cannon),
             Err(PlacementError::WouldBlockPath)
         );
         assert!(!sim.has_tower(last_gap));
@@ -535,7 +652,7 @@ mod tests {
     fn selling_a_tower_frees_the_cell() {
         let mut sim = Simulation::new();
         let pos = CellPos::new(5, 5);
-        sim.place_tower(pos).unwrap();
+        sim.place_tower(pos, TowerKind::Cannon).unwrap();
 
         assert!(sim.sell_tower(pos));
         assert!(!sim.has_tower(pos));
@@ -547,7 +664,7 @@ mod tests {
     #[test]
     fn enemy_spawns_at_spawn_heading_toward_goal() {
         let mut sim = Simulation::new();
-        sim.spawn_enemy();
+        sim.spawn_enemy(EnemyKind::Grunt);
         let transit = sim.enemy_transit().expect("Enemy should be alive right after spawning");
         assert_eq!(transit.from, sim.grid().spawn());
         // With nothing blocking, Spawn (0,12) -> Goal (24,12) is a
@@ -559,7 +676,7 @@ mod tests {
     #[test]
     fn enemy_mid_cell_keeps_its_stored_path_across_a_grid_mutation() {
         let mut sim = Simulation::new();
-        sim.spawn_enemy();
+        sim.spawn_enemy(EnemyKind::Grunt);
 
         // Advance partway into the first Cell — not far enough to reach its center.
         sim.tick(0.1);
@@ -568,7 +685,7 @@ mod tests {
         assert!(before.progress > 0.0 && before.progress < 1.0);
 
         // A Grid mutation happening mid-transit must not retarget the Enemy.
-        sim.place_tower(CellPos::new(5, 12))
+        sim.place_tower(CellPos::new(5, 12), TowerKind::Cannon)
             .expect("placing off to the side of Spawn should stay legal");
         let after = sim.enemy_transit().unwrap();
         assert_eq!(after.to, before.to);
@@ -578,22 +695,22 @@ mod tests {
     #[test]
     fn enemy_recomputes_and_picks_up_a_changed_grid_on_reaching_a_cell_center() {
         let mut sim = Simulation::new();
-        sim.spawn_enemy();
+        sim.spawn_enemy(EnemyKind::Grunt);
 
         // Cross the full first Cell: Spawn -> (1,12), recomputing there
         // onto the still-open straight row, so target becomes (2,12).
-        sim.tick(1.0 / ENEMY_SPEED_CELLS_PER_SEC);
+        sim.tick(1.0 / EnemyKind::Grunt.speed());
         let at_first_center = sim.enemy_transit().unwrap();
         assert_eq!(at_first_center.from, CellPos::new(1, 12));
         assert_eq!(at_first_center.to, CellPos::new(2, 12));
 
         // Block the cell the Enemy was about to walk into next, *after*
         // it already committed to heading toward (2,12).
-        sim.place_tower(CellPos::new(3, 12))
+        sim.place_tower(CellPos::new(3, 12), TowerKind::Cannon)
             .expect("blocking one cell should still leave a detour");
 
         // Cross into (2,12): this is the recompute point.
-        sim.tick(1.0 / ENEMY_SPEED_CELLS_PER_SEC);
+        sim.tick(1.0 / EnemyKind::Grunt.speed());
         let at_second_center = sim.enemy_transit().unwrap();
         assert_eq!(at_second_center.from, CellPos::new(2, 12));
         assert_ne!(
@@ -606,11 +723,11 @@ mod tests {
     #[test]
     fn enemy_reaching_goal_despawns() {
         let mut sim = Simulation::new();
-        sim.spawn_enemy();
+        sim.spawn_enemy(EnemyKind::Grunt);
 
         let steps_to_goal = sim.grid().goal().x - sim.grid().spawn().x;
         for _ in 0..steps_to_goal {
-            sim.tick(1.0 / ENEMY_SPEED_CELLS_PER_SEC);
+            sim.tick(1.0 / EnemyKind::Grunt.speed());
         }
 
         assert!(!sim.enemy_alive());
@@ -624,9 +741,9 @@ mod tests {
     fn sim_with_enemy_and_adjacent_tower() -> Simulation {
         let mut sim = Simulation::new();
         let spawn = sim.grid().spawn();
-        sim.place_tower(CellPos::new(spawn.x, spawn.y + 1))
+        sim.place_tower(CellPos::new(spawn.x, spawn.y + 1), TowerKind::Cannon)
             .expect("a Tower one Cell above Spawn should be a legal, non-blocking placement");
-        sim.spawn_enemy();
+        sim.spawn_enemy(EnemyKind::Grunt);
         sim
     }
 
@@ -688,5 +805,67 @@ mod tests {
         sim.tick(0.5);
         assert_eq!(sim.projectile_count(), 0);
         assert!(!sim.enemy_alive());
+    }
+
+    #[test]
+    fn gatling_fires_faster_and_weaker_than_cannon() {
+        assert!(TowerKind::Gatling.damage() < TowerKind::Cannon.damage());
+        assert!(TowerKind::Gatling.cooldown() < TowerKind::Cannon.cooldown());
+    }
+
+    #[test]
+    fn each_enemy_kind_has_distinct_correct_stats() {
+        assert!(EnemyKind::Runner.health() < EnemyKind::Grunt.health());
+        assert!(EnemyKind::Grunt.health() < EnemyKind::Tank.health());
+        assert!(EnemyKind::Runner.speed() > EnemyKind::Grunt.speed());
+        assert!(EnemyKind::Grunt.speed() > EnemyKind::Tank.speed());
+    }
+
+    #[test]
+    fn spawn_enemy_uses_the_given_kinds_health() {
+        let mut sim = Simulation::new();
+        sim.spawn_enemy(EnemyKind::Tank);
+        assert_eq!(sim.enemy_health(), Some(EnemyKind::Tank.health()));
+    }
+
+    #[test]
+    fn frost_slow_applies_only_within_range_and_clears_the_moment_it_leaves() {
+        let mut sim = Simulation::new();
+        let spawn = sim.grid().spawn();
+        sim.place_tower(CellPos::new(spawn.x, spawn.y + 1), TowerKind::Frost)
+            .expect("a Frost Tower one Cell above Spawn should be a legal, non-blocking placement");
+        sim.spawn_enemy(EnemyKind::Grunt);
+
+        // (3,12) is within the Frost Tower's Range: distance to (0,13)
+        // is sqrt(3^2 + 1^2) ~= 3.16, under FROST_RANGE_CELLS (3.5).
+        {
+            let enemy = sim.enemy.as_mut().unwrap();
+            enemy.at = CellPos::new(3, 12);
+            enemy.target = Some(CellPos::new(4, 12));
+            enemy.progress = 0.0;
+        }
+        assert_eq!(sim.frost_slow_multiplier(), FROST_SLOW_MULTIPLIER);
+
+        // One Cell further out, (4,12), is just outside Range: distance
+        // to (0,13) is sqrt(4^2 + 1^2) ~= 4.12, over FROST_RANGE_CELLS.
+        sim.enemy.as_mut().unwrap().at = CellPos::new(4, 12);
+        assert_eq!(sim.frost_slow_multiplier(), 1.0);
+    }
+
+    #[test]
+    fn an_enemy_inside_frost_range_covers_less_ground_per_tick() {
+        let mut sim = Simulation::new();
+        let spawn = sim.grid().spawn();
+        sim.place_tower(CellPos::new(spawn.x, spawn.y + 1), TowerKind::Frost)
+            .expect("a Frost Tower one Cell above Spawn should be a legal, non-blocking placement");
+        sim.spawn_enemy(EnemyKind::Grunt);
+
+        sim.tick(0.1);
+        let slowed_progress = sim.enemy_transit().unwrap().progress;
+        let unslowed_progress = 0.1 * EnemyKind::Grunt.speed();
+        assert!(
+            slowed_progress < unslowed_progress - f32::EPSILON,
+            "an Enemy within Frost Range should move slower than its base speed"
+        );
     }
 }

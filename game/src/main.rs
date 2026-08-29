@@ -1,6 +1,6 @@
 use bevy::color::palettes::css;
 use bevy::prelude::*;
-use simulation::{CellKind, CellPos, Grid, Simulation, CELL_SIZE_PX, GRID_SIZE};
+use simulation::{CellKind, CellPos, EnemyKind, Grid, Simulation, TowerKind, CELL_SIZE_PX, GRID_SIZE};
 
 const GRID_PX: f32 = CELL_SIZE_PX * GRID_SIZE as f32; // 500.0
 const SIDEBAR_PX: f32 = 200.0;
@@ -19,13 +19,20 @@ fn main() {
             ..default()
         }))
         .insert_resource(SimState(Simulation::new()))
+        .insert_resource(SelectedTowerKind(TowerKind::Cannon))
         .add_systems(
             Startup,
             (spawn_camera, spawn_grid, spawn_sidebar, spawn_enemy),
         )
         .add_systems(
             Update,
-            (interact_with_grid, move_enemy, sync_projectiles).chain(),
+            (
+                select_tower_kind,
+                interact_with_grid,
+                move_enemy,
+                sync_projectiles,
+            )
+                .chain(),
         )
         .run();
 }
@@ -34,6 +41,17 @@ fn main() {
 /// one seam the Bevy layer talks to for all placement/Path logic.
 #[derive(Resource)]
 struct SimState(Simulation);
+
+/// Which Tower Kind the next Cell click will place, chosen via the
+/// sidebar's Tower Kind buttons.
+#[derive(Resource)]
+struct SelectedTowerKind(TowerKind);
+
+/// Marks a sidebar Tower Kind selection button with the Kind it
+/// selects, so `select_tower_kind` can tell them apart and
+/// re-highlight whichever is currently selected.
+#[derive(Component)]
+struct TowerKindButton(TowerKind);
 
 /// Marks the Tower sprite placed at a given Cell, so it can be found
 /// again on sell.
@@ -95,8 +113,12 @@ fn world_to_cell(world: Vec2) -> Option<CellPos> {
     ))
 }
 
-fn tower_color() -> Color {
-    Color::Srgba(css::RED) // Cannon; other Tower Kind land in ticket 05
+fn tower_color(kind: TowerKind) -> Color {
+    match kind {
+        TowerKind::Cannon => Color::Srgba(css::RED),
+        TowerKind::Gatling => Color::Srgba(css::GREEN),
+        TowerKind::Frost => Color::Srgba(css::BLUE),
+    }
 }
 
 fn path_preview_color() -> Color {
@@ -104,7 +126,15 @@ fn path_preview_color() -> Color {
 }
 
 fn enemy_color() -> Color {
-    Color::Srgba(css::LIME) // Grunt; other Enemy Kind land in ticket 05
+    Color::Srgba(css::LIME) // only Grunt is spawned before Wave spawning (ticket 08)
+}
+
+fn button_color(selected: bool) -> Color {
+    if selected {
+        Color::srgb(0.45, 0.45, 0.55)
+    } else {
+        Color::srgb(0.25, 0.25, 0.3)
+    }
 }
 
 fn projectile_color() -> Color {
@@ -167,7 +197,11 @@ fn spawn_sidebar(mut commands: Commands) {
                 ..default()
             });
 
-            for label in ["Cannon", "Gatling", "Frost"] {
+            for (label, kind) in [
+                ("Cannon", TowerKind::Cannon),
+                ("Gatling", TowerKind::Gatling),
+                ("Frost", TowerKind::Frost),
+            ] {
                 sidebar
                     .spawn((
                         Button,
@@ -175,13 +209,32 @@ fn spawn_sidebar(mut commands: Commands) {
                             padding: UiRect::all(Val::Px(8.0)),
                             ..default()
                         },
-                        BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                        BackgroundColor(button_color(kind == TowerKind::Cannon)),
+                        TowerKindButton(kind),
                     ))
                     .with_children(|button| {
                         button.spawn((Text::new(label), TextColor(Color::WHITE)));
                     });
             }
         });
+}
+
+/// Handles clicks on the sidebar's Tower Kind buttons: updates which
+/// Kind `interact_with_grid` will place next, and re-highlights the
+/// buttons to reflect the current selection.
+fn select_tower_kind(
+    mut selected: ResMut<SelectedTowerKind>,
+    interactions: Query<(&Interaction, &TowerKindButton), Changed<Interaction>>,
+    mut buttons: Query<(&TowerKindButton, &mut BackgroundColor)>,
+) {
+    for (interaction, button) in &interactions {
+        if *interaction == Interaction::Pressed {
+            selected.0 = button.0;
+        }
+    }
+    for (button, mut background) in &mut buttons {
+        *background = BackgroundColor(button_color(button.0 == selected.0));
+    }
 }
 
 /// Single seam between mouse input and the `simulation` crate: figures
@@ -194,6 +247,7 @@ fn interact_with_grid(
     camera: Query<(&Camera, &GlobalTransform)>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut sim: ResMut<SimState>,
+    selected: Res<SelectedTowerKind>,
     towers: Query<(Entity, &TowerAt)>,
     preview_tiles: Query<Entity, With<PathPreviewTile>>,
 ) {
@@ -244,10 +298,10 @@ fn interact_with_grid(
                 commands.entity(entity).despawn();
             }
         }
-    } else if sim.0.place_tower(hovered).is_ok() {
+    } else if sim.0.place_tower(hovered, selected.0).is_ok() {
         commands.spawn((
             Sprite {
-                color: tower_color(),
+                color: tower_color(selected.0),
                 custom_size: Some(Vec2::splat(CELL_SIZE_PX - 1.0)),
                 ..default()
             },
@@ -258,7 +312,7 @@ fn interact_with_grid(
 }
 
 fn spawn_enemy(mut commands: Commands, mut sim: ResMut<SimState>) {
-    sim.0.spawn_enemy();
+    sim.0.spawn_enemy(EnemyKind::Grunt);
     let Some(transit) = sim.0.enemy_transit() else {
         return;
     };
