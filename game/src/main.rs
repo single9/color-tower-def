@@ -23,10 +23,7 @@ fn main() {
         .insert_resource(SimState(Simulation::new()))
         .insert_resource(SelectedTowerKind(TowerKind::Cannon))
         .insert_resource(SelectedTower(None))
-        .add_systems(
-            Startup,
-            (spawn_camera, spawn_grid, spawn_sidebar, spawn_enemy),
-        )
+        .add_systems(Startup, (spawn_camera, spawn_grid, spawn_sidebar))
         .add_systems(
             Update,
             (
@@ -34,9 +31,12 @@ fn main() {
                 interact_with_grid,
                 handle_tower_panel_buttons,
                 sync_tower_info_panel,
-                move_enemy,
+                handle_wave_button,
+                tick_simulation,
+                sync_enemies,
                 sync_projectiles,
                 sync_gold_text,
+                sync_wave_ui,
             )
                 .chain(),
         )
@@ -69,8 +69,8 @@ struct TowerAt(CellPos);
 #[derive(Component)]
 struct PathPreviewTile;
 
-/// Marks the sprite entity representing the live Enemy. Ticket 03
-/// only has a single Enemy on screen at once.
+/// Marks a live Enemy sprite, cleared and redrawn from `simulation`
+/// state every frame (mirrors `PathPreviewTile`'s approach).
 #[derive(Component)]
 struct EnemyMarker;
 
@@ -82,6 +82,14 @@ struct ProjectileMarker;
 /// Marks the sidebar's live Gold readout text.
 #[derive(Component)]
 struct GoldText;
+
+/// Marks the sidebar's live Wave readout text.
+#[derive(Component)]
+struct WaveText;
+
+/// The sidebar's "Start Next Wave" button.
+#[derive(Component)]
+struct WaveButton;
 
 /// The Tower currently selected for inspection (clicked on the Grid),
 /// whose info panel is showing in the sidebar. `None` when nothing is
@@ -154,8 +162,12 @@ fn path_preview_color() -> Color {
     Color::srgba(1.0, 1.0, 0.0, 0.35) // translucent yellow
 }
 
-fn enemy_color() -> Color {
-    Color::Srgba(css::LIME) // only Grunt is spawned before Wave spawning (ticket 08)
+fn enemy_color(kind: EnemyKind) -> Color {
+    match kind {
+        EnemyKind::Grunt => Color::Srgba(css::LIME),
+        EnemyKind::Runner => Color::Srgba(css::YELLOW),
+        EnemyKind::Tank => Color::Srgba(css::SIENNA),
+    }
 }
 
 fn button_color(selected: bool) -> Color {
@@ -218,9 +230,24 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                 TextColor(Color::WHITE),
             ));
             sidebar.spawn((
-                Text::new("Wave: -"),
+                Text::new(format!("Wave: {}", sim.0.wave_number())),
                 TextColor(Color::WHITE),
+                WaveText,
             ));
+
+            sidebar
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(8.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.2, 0.35, 0.2)),
+                    WaveButton,
+                ))
+                .with_children(|button| {
+                    button.spawn((Text::new("Start Next Wave"), TextColor(Color::WHITE)));
+                });
 
             sidebar.spawn(Node {
                 height: Val::Px(16.0),
@@ -491,45 +518,52 @@ fn sync_tower_info_panel(
     });
 }
 
-fn spawn_enemy(mut commands: Commands, mut sim: ResMut<SimState>) {
-    sim.0.spawn_enemy(EnemyKind::Grunt);
-    let Some(transit) = sim.0.enemy_transit() else {
-        return;
-    };
-    commands.spawn((
-        Sprite {
-            color: enemy_color(),
-            custom_size: Some(Vec2::splat(CELL_SIZE_PX * 0.6)),
-            ..default()
-        },
-        Transform::from_translation(cell_world_pos(transit.from).with_z(2.0)),
-        EnemyMarker,
-    ));
+/// Advances `simulation` by one frame: Wave spawning, Enemy movement,
+/// Tower firing, Projectile flight/impact, Wave-completion bookkeeping.
+/// Kept separate from rendering so `sync_enemies`/`sync_projectiles`
+/// read post-tick state, mirroring how `sync_projectiles` already
+/// depended on `move_enemy` ticking first in earlier tickets.
+fn tick_simulation(time: Res<Time>, mut sim: ResMut<SimState>) {
+    sim.0.tick(time.delta_secs());
 }
 
-/// Advances the `simulation` Enemy and mirrors its position onto the
-/// Bevy sprite, interpolating between the two Cell centers of its
-/// current transit segment. Despawns the sprite once the Enemy
-/// reaches Goal and `simulation` drops it.
-fn move_enemy(
-    time: Res<Time>,
-    mut sim: ResMut<SimState>,
+/// Redraws every live Enemy from `simulation` state, mirroring the
+/// Path-preview/Projectile approach: clear last frame's sprites,
+/// respawn fresh ones at this frame's positions and Kind's color.
+fn sync_enemies(
     mut commands: Commands,
-    mut enemy_sprite: Query<(Entity, &mut Transform), With<EnemyMarker>>,
+    sim: Res<SimState>,
+    existing: Query<Entity, With<EnemyMarker>>,
 ) {
-    sim.0.tick(time.delta_secs());
+    for entity in &existing {
+        commands.entity(entity).despawn();
+    }
+    for (kind, transit) in sim.0.enemies_transits() {
+        let from = cell_world_pos(transit.from);
+        let to = cell_world_pos(transit.to);
+        commands.spawn((
+            Sprite {
+                color: enemy_color(kind),
+                custom_size: Some(Vec2::splat(CELL_SIZE_PX * 0.6)),
+                ..default()
+            },
+            Transform::from_translation(from.lerp(to, transit.progress).with_z(2.0)),
+            EnemyMarker,
+        ));
+    }
+}
 
-    let Ok((entity, mut transform)) = enemy_sprite.get_single_mut() else {
-        return;
-    };
-
-    match sim.0.enemy_transit() {
-        Some(transit) => {
-            let from = cell_world_pos(transit.from);
-            let to = cell_world_pos(transit.to);
-            transform.translation = from.lerp(to, transit.progress).with_z(2.0);
+/// Starts the next Wave when the sidebar's button is pressed. A press
+/// while a Wave is still in progress is a no-op, mirroring how a
+/// failed placement or upgrade is already just ignored elsewhere.
+fn handle_wave_button(
+    mut sim: ResMut<SimState>,
+    interactions: Query<&Interaction, (With<WaveButton>, Changed<Interaction>)>,
+) {
+    for interaction in &interactions {
+        if *interaction == Interaction::Pressed {
+            let _ = sim.0.start_next_wave();
         }
-        None => commands.entity(entity).despawn(),
     }
 }
 
@@ -565,4 +599,24 @@ fn sync_gold_text(sim: Res<SimState>, mut text: Query<&mut Text, With<GoldText>>
         return;
     };
     text.0 = format!("Gold: {}", sim.0.gold());
+}
+
+/// Keeps the sidebar's Wave readout and "Start Next Wave" button in
+/// sync with `simulation` state: the button dims while a Wave is
+/// still in progress, since pressing it then is a no-op.
+fn sync_wave_ui(
+    sim: Res<SimState>,
+    mut text: Query<&mut Text, With<WaveText>>,
+    mut button: Query<&mut BackgroundColor, With<WaveButton>>,
+) {
+    if let Ok(mut text) = text.get_single_mut() {
+        text.0 = format!("Wave: {}", sim.0.wave_number());
+    }
+    if let Ok(mut background) = button.get_single_mut() {
+        *background = BackgroundColor(if sim.0.wave_in_progress() {
+            Color::srgb(0.15, 0.2, 0.15)
+        } else {
+            Color::srgb(0.2, 0.35, 0.2)
+        });
+    }
 }

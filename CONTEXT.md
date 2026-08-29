@@ -80,7 +80,7 @@ Enemy 目前剩餘的生命值,歸零即死亡並掉落 Gold。
 _Avoid_: HP(與 Lives 都可能被稱為「生命」,用 Health 專指 Enemy,用 Lives 專指玩家,避免混淆)
 
 **Wave**:
-玩家手動觸發的一次敵人生成事件,包含固定數量與強度的 Enemy,依序間隔出現於 Spawn。整場遊戲共 15 個 Wave,全數通過即 Victory。
+玩家手動觸發的一次敵人生成事件,包含固定數量與強度的 Enemy,依序間隔(0.8 秒)出現於 Spawn。整場遊戲共 15 個 Wave,全數通過即 Victory。第 n 個 Wave 生成 `5 + n` 隻 Enemy,每隻 Health 為基礎值乘上 `1 + n * 0.1`;Enemy Kind 依 Grunt → Runner → Tank 固定順序循環分配(實作於 ticket 08 時決定,任意但均勻的組成)。Wave 進行中(尚有 Enemy 待生成或存活)無法觸發下一個 Wave。
 _Avoid_: Round, Level(Level 已用於其他語境,避免重疊)
 
 **Leak**:

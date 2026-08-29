@@ -137,6 +137,16 @@ const UPGRADE_COST_FRACTION: f32 = 0.8;
 /// Multiplier applied to a Tower's primary stat per Tier over Tier 1.
 const TIER_STAT_MULTIPLIER: f32 = 1.3;
 
+/// Total Wave count for the MVP (out of scope: anything past Wave 15).
+pub const TOTAL_WAVES: u32 = 15;
+/// Seconds between each Enemy spawning within a Wave.
+const SPAWN_INTERVAL_SECONDS: f32 = 0.8;
+/// Health multiplier applied to every Enemy in Wave `n`: `1 + n * this`.
+const WAVE_HEALTH_SCALING_PER_WAVE: f32 = 0.1;
+/// Extra Enemy beyond the flat `5` every Wave adds one of, per Wave
+/// number: Wave `n` spawns `WAVE_BASE_ENEMY_COUNT + n` Enemy total.
+const WAVE_BASE_ENEMY_COUNT: u32 = 5;
+
 /// The three Enemy Kind, each with distinct Health/speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnemyKind {
@@ -288,16 +298,42 @@ pub struct TowerStats {
     pub range: f32,
 }
 
+/// Why a "Start Next Wave" attempt failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveError {
+    /// The current Wave's Enemy are still spawning or alive.
+    WaveInProgress,
+}
+
+/// The Enemy Kind cycled through to build a Wave's spawn queue:
+/// Grunt, Runner, Tank, repeating — an even, arbitrary mix (ticket 08
+/// leaves the exact distribution to the implementer).
+const WAVE_ENEMY_KIND_CYCLE: [EnemyKind; 3] = [EnemyKind::Grunt, EnemyKind::Runner, EnemyKind::Tank];
+
 /// A single Enemy in transit between two Cell centers. `target` is
 /// `None` only in the rare case its onward Path vanished entirely
-/// (see `Simulation::tick_enemy_movement`).
+/// (see `Simulation::tick_enemies_movement`). `id` is unique for the
+/// Enemy's lifetime, so a Projectile can keep tracking the specific
+/// Enemy it was fired at even among several on screen at once.
 #[derive(Debug, Clone, Copy)]
 struct Enemy {
+    id: u32,
     at: CellPos,
     target: Option<CellPos>,
     progress: f32,
     health: f32,
     kind: EnemyKind,
+}
+
+impl Enemy {
+    /// Current position in Cell units, interpolated between `at` and
+    /// `target`'s centers.
+    fn position_cells(&self) -> (f32, f32) {
+        let to = self.target.unwrap_or(self.at);
+        let (fx, fy) = (self.at.x as f32, self.at.y as f32);
+        let (tx, ty) = (to.x as f32, to.y as f32);
+        (fx + (tx - fx) * self.progress, fy + (ty - fy) * self.progress)
+    }
 }
 
 /// Per-Tower runtime state. `purchase_price` is fixed at placement and
@@ -312,15 +348,16 @@ struct TowerRuntime {
     gold_spent: i32,
 }
 
-/// A shot in flight, tracking the live Enemy's position every tick
-/// (ADR-0001: plain distance check, no physics engine). Position is
-/// in Cell units, not pixels — the Bevy layer converts. `damage`
-/// carries the firing Tower Kind's damage so Gatling and Cannon
-/// shots resolve differently on hit.
+/// A shot in flight, tracking its target Enemy's position every tick
+/// by `target_id` (ADR-0001: plain distance check, no physics
+/// engine). Position is in Cell units, not pixels — the Bevy layer
+/// converts. `damage` carries the firing Tower Kind's damage so
+/// Gatling and Cannon shots resolve differently on hit.
 #[derive(Debug, Clone, Copy)]
 struct Projectile {
     pos: (f32, f32),
     damage: f32,
+    target_id: u32,
 }
 
 fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -355,9 +392,18 @@ pub struct EnemyTransit {
 pub struct Simulation {
     grid: Grid,
     towers: HashMap<CellPos, TowerRuntime>,
-    enemy: Option<Enemy>,
+    enemies: Vec<Enemy>,
+    next_enemy_id: u32,
     projectiles: Vec<Projectile>,
     gold: i32,
+    /// The Wave about to start (or currently in progress), 1-indexed.
+    wave_number: u32,
+    wave_in_progress: bool,
+    /// Enemy Kind still waiting to spawn for the in-progress Wave.
+    spawn_queue: VecDeque<EnemyKind>,
+    /// Counts down to the next spawn; an Enemy spawns whenever this
+    /// reaches zero and the queue isn't empty, then resets.
+    spawn_timer: f32,
 }
 
 impl Simulation {
@@ -365,9 +411,14 @@ impl Simulation {
         Self {
             grid: Grid::new(),
             towers: HashMap::new(),
-            enemy: None,
+            enemies: Vec::new(),
+            next_enemy_id: 0,
             projectiles: Vec::new(),
             gold: STARTING_GOLD,
+            wave_number: 1,
+            wave_in_progress: false,
+            spawn_queue: VecDeque::new(),
+            spawn_timer: 0.0,
         }
     }
 
@@ -491,27 +542,73 @@ impl Simulation {
         true
     }
 
-    /// Spawns one Enemy of the given Kind at Spawn, replacing any
-    /// Enemy already present. Ticket 05 only needs a single Enemy on
-    /// screen; Wave spawning of many at once lands in ticket 08.
-    pub fn spawn_enemy(&mut self, kind: EnemyKind) {
+    /// Spawns one Enemy of the given Kind at Spawn immediately,
+    /// outside the Wave system. Kept as a direct testing/authoring
+    /// seam for scenarios that only need a single Enemy; real
+    /// gameplay spawns exclusively through `start_next_wave`.
+    fn spawn_enemy_with_health(&mut self, kind: EnemyKind, health: f32) {
         let spawn = self.grid.spawn();
         let path = self.shortest_path(spawn, None);
-        self.enemy = Some(Enemy {
+        let id = self.next_enemy_id;
+        self.next_enemy_id += 1;
+        self.enemies.push(Enemy {
+            id,
             at: spawn,
             target: path.and_then(|p| p.get(1).copied()),
             progress: 0.0,
-            health: kind.health(),
+            health,
             kind,
         });
     }
 
+    /// Spawns one Enemy of the given Kind at Spawn with its unscaled
+    /// base Health. A direct single-Enemy testing/authoring seam;
+    /// real gameplay spawns exclusively through `start_next_wave`.
+    pub fn spawn_enemy(&mut self, kind: EnemyKind) {
+        self.spawn_enemy_with_health(kind, kind.health());
+    }
+
+    /// The Wave about to start (or currently in progress), 1-indexed.
+    /// Starts at 1 before any Wave has been started.
+    pub fn wave_number(&self) -> u32 {
+        self.wave_number
+    }
+
+    pub fn wave_in_progress(&self) -> bool {
+        self.wave_in_progress
+    }
+
+    /// Starts Wave `wave_number()`: queues `WAVE_BASE_ENEMY_COUNT + n`
+    /// Enemy (mixed Grunt/Runner/Tank, see `WAVE_ENEMY_KIND_CYCLE`) to
+    /// spawn one at a time, `SPAWN_INTERVAL_SECONDS` apart, each with
+    /// Health scaled by `1 + n * WAVE_HEALTH_SCALING_PER_WAVE`.
+    /// Rejected while the current Wave is still spawning or has any
+    /// Enemy alive.
+    pub fn start_next_wave(&mut self) -> Result<(), WaveError> {
+        if self.wave_in_progress {
+            return Err(WaveError::WaveInProgress);
+        }
+        let count = WAVE_BASE_ENEMY_COUNT + self.wave_number;
+        self.spawn_queue = (0..count)
+            .map(|i| WAVE_ENEMY_KIND_CYCLE[i as usize % WAVE_ENEMY_KIND_CYCLE.len()])
+            .collect();
+        self.spawn_timer = 0.0;
+        self.wave_in_progress = true;
+        Ok(())
+    }
+
+    /// Health an Enemy spawned in the current Wave should have: base
+    /// Health scaled by `1 + n * WAVE_HEALTH_SCALING_PER_WAVE`.
+    fn current_wave_enemy_health(&self, kind: EnemyKind) -> f32 {
+        kind.health() * (1.0 + self.wave_number as f32 * WAVE_HEALTH_SCALING_PER_WAVE)
+    }
+
     pub fn enemy_alive(&self) -> bool {
-        self.enemy.is_some()
+        !self.enemies.is_empty()
     }
 
     pub fn enemy_health(&self) -> Option<f32> {
-        self.enemy.as_ref().map(|e| e.health)
+        self.enemies.first().map(|e| e.health)
     }
 
     pub fn projectile_count(&self) -> usize {
@@ -524,35 +621,72 @@ impl Simulation {
         self.projectiles.iter().map(|p| p.pos)
     }
 
-    /// The live Enemy's current transit segment (where it's coming
-    /// from, where it's headed, how far along it is), for the Bevy
-    /// layer to interpolate a world position from. `None` once the
-    /// Enemy has reached Goal and despawned.
+    /// The first live Enemy's current transit segment (where it's
+    /// coming from, where it's headed, how far along it is), for the
+    /// Bevy layer to interpolate a world position from. `None` once no
+    /// Enemy is alive. A single-Enemy convenience; `enemies_transits`
+    /// covers every Enemy at once for real gameplay.
     pub fn enemy_transit(&self) -> Option<EnemyTransit> {
-        self.enemy.as_ref().map(|enemy| EnemyTransit {
+        self.enemies.first().map(Self::transit_of)
+    }
+
+    fn transit_of(enemy: &Enemy) -> EnemyTransit {
+        EnemyTransit {
             from: enemy.at,
             to: enemy.target.unwrap_or(enemy.at),
             progress: if enemy.target.is_some() { enemy.progress } else { 0.0 },
-        })
+        }
     }
 
-    /// Advances the whole Simulation by `dt` seconds: Enemy movement
-    /// (at whatever speed the current Frost coverage allows), then
-    /// Tower firing, then Projectile flight/impact.
+    /// Every live Enemy's Kind and current transit segment, for the
+    /// Bevy layer to render each one.
+    pub fn enemies_transits(&self) -> impl Iterator<Item = (EnemyKind, EnemyTransit)> + '_ {
+        self.enemies.iter().map(|e| (e.kind, Self::transit_of(e)))
+    }
+
+    /// Advances the whole Simulation by `dt` seconds: Wave spawning,
+    /// then Enemy movement (at whatever speed the current Frost
+    /// coverage allows), then Tower firing, then Projectile
+    /// flight/impact, then Wave-completion bookkeeping.
     pub fn tick(&mut self, dt: f32) {
-        let slow_multiplier = self.frost_slow_multiplier();
-        self.tick_enemy_movement(dt, slow_multiplier);
+        self.tick_spawning(dt);
+        self.tick_enemies_movement(dt);
         self.tick_towers(dt);
         self.tick_projectiles(dt);
+        self.tick_wave_completion();
     }
 
-    /// Whether the live Enemy's current position falls within any
-    /// Frost Tower's Range right now. Re-evaluated fresh every tick —
-    /// no lingering effect once the Enemy steps back outside.
-    fn frost_slow_multiplier(&self) -> f32 {
-        let Some(enemy_pos) = self.enemy_position_cells() else {
-            return 1.0;
-        };
+    /// Dequeues Enemy from the in-progress Wave's `spawn_queue` one at
+    /// a time, `SPAWN_INTERVAL_SECONDS` apart, starting immediately
+    /// when a Wave begins.
+    fn tick_spawning(&mut self, dt: f32) {
+        if !self.wave_in_progress {
+            return;
+        }
+        self.spawn_timer -= dt;
+        while self.spawn_timer <= 0.0 {
+            let Some(kind) = self.spawn_queue.pop_front() else {
+                break;
+            };
+            let health = self.current_wave_enemy_health(kind);
+            self.spawn_enemy_with_health(kind, health);
+            self.spawn_timer += SPAWN_INTERVAL_SECONDS;
+        }
+    }
+
+    /// A Wave is complete once every Enemy has been spawned and none
+    /// remain alive; advances to the next Wave number when so.
+    fn tick_wave_completion(&mut self) {
+        if self.wave_in_progress && self.spawn_queue.is_empty() && self.enemies.is_empty() {
+            self.wave_in_progress = false;
+            self.wave_number += 1;
+        }
+    }
+
+    /// Whether `enemy_pos` falls within any Frost Tower's Range right
+    /// now. Re-evaluated fresh every tick, per Enemy — no lingering
+    /// effect once an Enemy steps back outside.
+    fn frost_slow_multiplier_at(&self, enemy_pos: (f32, f32)) -> f32 {
         let in_frost = self.towers.iter().any(|(pos, runtime)| {
             runtime.kind == TowerKind::Frost
                 && distance((pos.x as f32, pos.y as f32), enemy_pos)
@@ -565,66 +699,63 @@ impl Simulation {
         }
     }
 
-    /// Advances the live Enemy by `dt` seconds at its Kind's base
-    /// speed times `speed_multiplier` (Frost slow). Per ADR-0002, the
+    /// Advances every Enemy by `dt` seconds at its Kind's base speed
+    /// times its own current Frost slow multiplier. Per ADR-0002, an
     /// Enemy's Path is only ever recomputed the instant it reaches a
     /// Cell center — never mid-transit, no matter how the Grid changes
-    /// underneath it in the meantime.
-    fn tick_enemy_movement(&mut self, dt: f32, speed_multiplier: f32) {
-        let Some((at, target, mut progress, kind)) = self
-            .enemy
-            .as_ref()
-            .map(|enemy| (enemy.at, enemy.target, enemy.progress, enemy.kind))
-        else {
-            return;
-        };
+    /// underneath it in the meantime. An Enemy that reaches Goal
+    /// leaks (despawns here; Lives/Leak bookkeeping lands in ticket 09).
+    fn tick_enemies_movement(&mut self, dt: f32) {
+        let goal = self.grid.goal();
+        let mut i = 0;
+        while i < self.enemies.len() {
+            let (at, target, mut progress, kind) = {
+                let e = &self.enemies[i];
+                (e.at, e.target, e.progress, e.kind)
+            };
 
-        let Some(target) = target else {
-            // Stuck at a Cell whose onward Path vanished; try again
-            // every tick in case the Grid opens back up.
-            let new_target = self.shortest_path(at, None).and_then(|p| p.get(1).copied());
-            self.enemy.as_mut().unwrap().target = new_target;
-            return;
-        };
+            let Some(target) = target else {
+                // Stuck at a Cell whose onward Path vanished; try
+                // again every tick in case the Grid opens back up.
+                let new_target = self.shortest_path(at, None).and_then(|p| p.get(1).copied());
+                self.enemies[i].target = new_target;
+                i += 1;
+                continue;
+            };
 
-        progress += dt * kind.speed() * speed_multiplier;
-        if progress < 1.0 {
-            self.enemy.as_mut().unwrap().progress = progress;
-            return;
+            let speed_multiplier = self.frost_slow_multiplier_at(self.enemies[i].position_cells());
+            progress += dt * kind.speed() * speed_multiplier;
+            if progress < 1.0 {
+                self.enemies[i].progress = progress;
+                i += 1;
+                continue;
+            }
+
+            if target == goal {
+                self.enemies.remove(i);
+                continue;
+            }
+
+            // Just reached a Cell center: recompute the remaining Path
+            // from here, picking up whatever the Grid looks like *now*.
+            let new_target = self.shortest_path(target, None).and_then(|p| p.get(1).copied());
+            let enemy = &mut self.enemies[i];
+            enemy.at = target;
+            enemy.progress = 0.0;
+            enemy.target = new_target;
+            i += 1;
         }
-
-        if target == self.grid.goal() {
-            self.enemy = None;
-            return;
-        }
-
-        // Just reached a Cell center: recompute the remaining Path
-        // from here, picking up whatever the Grid looks like *now*.
-        let new_target = self.shortest_path(target, None).and_then(|p| p.get(1).copied());
-        let enemy = self.enemy.as_mut().unwrap();
-        enemy.at = target;
-        enemy.progress = 0.0;
-        enemy.target = new_target;
-    }
-
-    /// Where the live Enemy currently sits, in Cell units, interpolated
-    /// between its current transit segment's two Cell centers.
-    fn enemy_position_cells(&self) -> Option<(f32, f32)> {
-        self.enemy_transit().map(|t| {
-            let (fx, fy) = (t.from.x as f32, t.from.y as f32);
-            let (tx, ty) = (t.to.x as f32, t.to.y as f32);
-            (fx + (tx - fx) * t.progress, fy + (ty - fy) * t.progress)
-        })
     }
 
     /// Ticks down every projectile-firing Tower's cooldown and fires a
-    /// Projectile from any that's ready and has the Enemy within
-    /// Range. Frost Towers never fire — their slow is applied directly
-    /// in `tick`, not through this pipeline.
+    /// Projectile at its nearest in-Range Enemy, if any, from any
+    /// Tower that's ready. Frost Towers never fire — their slow is
+    /// applied directly in `tick_enemies_movement`, not through this
+    /// pipeline.
     fn tick_towers(&mut self, dt: f32) {
-        let Some(enemy_pos) = self.enemy_position_cells() else {
+        if self.enemies.is_empty() {
             return;
-        };
+        }
 
         let positions: Vec<CellPos> = self.towers.keys().copied().collect();
         for pos in positions {
@@ -638,46 +769,54 @@ impl Simulation {
             }
 
             let tower_pos = (pos.x as f32, pos.y as f32);
-            if distance(tower_pos, enemy_pos) <= runtime.kind.range(runtime.tier) {
+            let range = runtime.kind.range(runtime.tier);
+            let nearest_in_range = self
+                .enemies
+                .iter()
+                .map(|e| (e.id, distance(tower_pos, e.position_cells())))
+                .filter(|&(_, dist)| dist <= range)
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+            if let Some((target_id, _)) = nearest_in_range {
                 runtime.cooldown_remaining = runtime.kind.cooldown();
                 self.projectiles.push(Projectile {
                     pos: tower_pos,
                     damage: runtime.kind.damage(runtime.tier),
+                    target_id,
                 });
             }
         }
     }
 
-    /// Moves every Projectile toward the live Enemy's current position
-    /// and resolves hits (ADR-0001: plain distance check). A
+    /// Moves every Projectile toward its target Enemy's current
+    /// position and resolves hits (ADR-0001: plain distance check). A
     /// Projectile whose target has died — from this hit or an earlier
-    /// one this same tick — despawns without effect.
+    /// one this same tick, or from anything else — despawns without
+    /// effect on any other Enemy.
     fn tick_projectiles(&mut self, dt: f32) {
-        let Some(enemy_pos) = self.enemy_position_cells() else {
-            self.projectiles.clear();
-            return;
-        };
-
         let in_flight = std::mem::take(&mut self.projectiles);
         let mut remaining = Vec::with_capacity(in_flight.len());
-        for mut projectile in in_flight {
-            if self.enemy.is_none() {
-                continue;
-            }
+        let mut gold_earned = 0;
 
-            if distance(projectile.pos, enemy_pos) <= PROJECTILE_HIT_DISTANCE_CELLS {
-                if let Some(enemy) = self.enemy.as_mut() {
-                    enemy.health -= projectile.damage;
-                    if enemy.health <= 0.0 {
-                        self.gold += enemy.kind.gold_reward();
-                        self.enemy = None;
-                    }
+        for mut projectile in in_flight {
+            let Some(target_index) = self.enemies.iter().position(|e| e.id == projectile.target_id)
+            else {
+                continue;
+            };
+            let target_pos = self.enemies[target_index].position_cells();
+
+            if distance(projectile.pos, target_pos) <= PROJECTILE_HIT_DISTANCE_CELLS {
+                let enemy = &mut self.enemies[target_index];
+                enemy.health -= projectile.damage;
+                if enemy.health <= 0.0 {
+                    gold_earned += enemy.kind.gold_reward();
+                    self.enemies.remove(target_index);
                 }
                 continue;
             }
 
-            let dx = enemy_pos.0 - projectile.pos.0;
-            let dy = enemy_pos.1 - projectile.pos.1;
+            let dx = target_pos.0 - projectile.pos.0;
+            let dy = target_pos.1 - projectile.pos.1;
             let dist = (dx * dx + dy * dy).sqrt();
             let step = PROJECTILE_SPEED_CELLS_PER_SEC * dt;
             if dist > f32::EPSILON {
@@ -687,6 +826,7 @@ impl Simulation {
             remaining.push(projectile);
         }
         self.projectiles = remaining;
+        self.gold += gold_earned;
     }
 
     /// BFS from `from` to Goal, treating every placed Tower — plus
@@ -981,7 +1121,7 @@ mod tests {
 
         // The Enemy dies from something else entirely before the
         // in-flight Projectile reaches it.
-        sim.enemy = None;
+        sim.enemies.clear();
 
         // Advancing further must not panic, must clear the now-orphaned
         // Projectile, and must not resurrect or otherwise affect anything.
@@ -1022,17 +1162,19 @@ mod tests {
         // (3,12) is within the Frost Tower's Range: distance to (0,13)
         // is sqrt(3^2 + 1^2) ~= 3.16, under FROST_RANGE_CELLS (3.5).
         {
-            let enemy = sim.enemy.as_mut().unwrap();
+            let enemy = sim.enemies.first_mut().unwrap();
             enemy.at = CellPos::new(3, 12);
             enemy.target = Some(CellPos::new(4, 12));
             enemy.progress = 0.0;
         }
-        assert_eq!(sim.frost_slow_multiplier(), FROST_SLOW_MULTIPLIER);
+        let pos_in_range = sim.enemies[0].position_cells();
+        assert_eq!(sim.frost_slow_multiplier_at(pos_in_range), FROST_SLOW_MULTIPLIER);
 
         // One Cell further out, (4,12), is just outside Range: distance
         // to (0,13) is sqrt(4^2 + 1^2) ~= 4.12, over FROST_RANGE_CELLS.
-        sim.enemy.as_mut().unwrap().at = CellPos::new(4, 12);
-        assert_eq!(sim.frost_slow_multiplier(), 1.0);
+        sim.enemies.first_mut().unwrap().at = CellPos::new(4, 12);
+        let pos_out_of_range = sim.enemies[0].position_cells();
+        assert_eq!(sim.frost_slow_multiplier_at(pos_out_of_range), 1.0);
     }
 
     #[test]
@@ -1185,5 +1327,60 @@ mod tests {
 
         let expected_refund = (total_spent as f32 * SELL_REFUND_FRACTION).round() as i32;
         assert_eq!(sim.gold(), gold_before_sell + expected_refund);
+    }
+
+    #[test]
+    fn wave_enemy_count_and_health_scale_correctly_for_wave_one_a_middle_wave_and_wave_fifteen() {
+        fn assert_wave_matches_formula_then_force_complete(sim: &mut Simulation, n: u32) {
+            assert_eq!(sim.wave_number(), n);
+            sim.start_next_wave().unwrap();
+            assert_eq!(sim.spawn_queue.len() as u32, WAVE_BASE_ENEMY_COUNT + n);
+
+            // spawn_timer starts at 0.0, so a negligible tick spawns
+            // exactly the queue's first (Grunt) Enemy and no more.
+            sim.tick(0.001);
+            let expected_health =
+                EnemyKind::Grunt.health() * (1.0 + n as f32 * WAVE_HEALTH_SCALING_PER_WAVE);
+            assert_eq!(sim.enemy_health(), Some(expected_health));
+
+            // Force this Wave to completion so the next assertion
+            // starts from a clean, un-in-progress state.
+            sim.spawn_queue.clear();
+            sim.enemies.clear();
+            sim.tick(0.001);
+            assert_eq!(sim.wave_number(), n + 1);
+        }
+
+        let mut sim = Simulation::new();
+        assert_wave_matches_formula_then_force_complete(&mut sim, 1);
+
+        while sim.wave_number() < 7 {
+            sim.start_next_wave().unwrap();
+            sim.spawn_queue.clear();
+            sim.enemies.clear();
+            sim.tick(0.001);
+        }
+        assert_wave_matches_formula_then_force_complete(&mut sim, 7);
+
+        while sim.wave_number() < 15 {
+            sim.start_next_wave().unwrap();
+            sim.spawn_queue.clear();
+            sim.enemies.clear();
+            sim.tick(0.001);
+        }
+        assert_wave_matches_formula_then_force_complete(&mut sim, 15);
+    }
+
+    #[test]
+    fn starting_next_wave_is_rejected_while_current_wave_is_in_progress() {
+        let mut sim = Simulation::new();
+        sim.start_next_wave().unwrap();
+
+        assert_eq!(sim.start_next_wave(), Err(WaveError::WaveInProgress));
+
+        // Still rejected once every Enemy has spawned but at least one
+        // is still alive.
+        sim.spawn_queue.clear();
+        assert_eq!(sim.start_next_wave(), Err(WaveError::WaveInProgress));
     }
 }
