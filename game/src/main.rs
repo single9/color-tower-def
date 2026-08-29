@@ -6,6 +6,13 @@ use simulation::{
     CellKind, CellPos, EnemyKind, GameOutcome, Simulation, TowerKind, TowerTier, CELL_SIZE_PX, GRID_SIZE,
 };
 
+/// Deployment version, injected by the GitHub Action at build time via
+/// `DEPLOY_VERSION`. Falls back to "dev" for local `cargo run` builds.
+const DEPLOY_VERSION: &str = match option_env!("DEPLOY_VERSION") {
+    Some(version) => version,
+    None => "dev",
+};
+
 const GRID_PX: f32 = CELL_SIZE_PX * GRID_SIZE as f32; // 500.0
 const SIDEBAR_PX: f32 = 200.0;
 const WINDOW_WIDTH: f32 = GRID_PX + SIDEBAR_PX; // 700.0
@@ -18,7 +25,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Tower Defense".into(),
+                title: format!("Tower Defense v{DEPLOY_VERSION}"),
                 resolution: (WINDOW_WIDTH, WINDOW_HEIGHT).into(),
                 resizable: false,
                 ..default()
@@ -424,6 +431,16 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                     ..default()
                 },
                 InfoPanelRoot,
+            ));
+
+            sidebar.spawn(Node {
+                flex_grow: 1.0,
+                ..default()
+            });
+
+            sidebar.spawn((
+                Text::new(format!("v{DEPLOY_VERSION}")),
+                TextColor(Color::srgb(0.5, 0.5, 0.55)),
             ));
         });
 }
