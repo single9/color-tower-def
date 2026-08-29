@@ -322,7 +322,7 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                 LivesText,
             ));
             sidebar.spawn((
-                Text::new(format!("Wave: {}", sim.0.wave_number())),
+                Text::new(format!("Wave: {}/{}", sim.0.wave_number(), simulation::TOTAL_WAVES)),
                 TextColor(Color::WHITE),
                 WaveText,
             ));
@@ -809,7 +809,7 @@ fn sync_wave_ui(
     mut button: Query<&mut BackgroundColor, With<WaveButton>>,
 ) {
     if let Ok(mut text) = text.get_single_mut() {
-        text.0 = format!("Wave: {}", sim.0.wave_number());
+        text.0 = format!("Wave: {}/{}", sim.0.wave_number(), simulation::TOTAL_WAVES);
     }
     if let Ok(mut background) = button.get_single_mut() {
         *background = BackgroundColor(if sim.0.wave_in_progress() {
