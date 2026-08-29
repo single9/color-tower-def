@@ -187,7 +187,7 @@ const PROJECTILE_SPEED_CELLS_PER_SEC: f32 = 8.0;
 const PROJECTILE_HIT_DISTANCE_CELLS: f32 = 0.25;
 
 /// Gold economy balance numbers pending playtesting.
-const STARTING_GOLD: i32 = 200;
+const STARTING_GOLD: i32 = 180;
 const CANNON_PRICE: i32 = 100;
 const GATLING_PRICE: i32 = 80;
 const FROST_PRICE: i32 = 120;
@@ -206,14 +206,23 @@ const TIER_STAT_MULTIPLIER: f32 = 1.3;
 /// Total Wave count for the MVP (out of scope: anything past Wave 15).
 pub const TOTAL_WAVES: u32 = 15;
 /// Lives the player starts with; a Leak decrements this by 1.
-const STARTING_LIVES: i32 = 20;
-/// Seconds between each Enemy spawning within a Wave.
+const STARTING_LIVES: i32 = 15;
+/// Seconds between each Enemy spawning within a Wave at Wave 1.
 const SPAWN_INTERVAL_SECONDS: f32 = 0.8;
+/// Per-Wave reduction in the spawn interval (seconds), so later Waves
+/// pressurise the player with faster spawns; clamped at a floor of
+/// `SPAWN_INTERVAL_FLOOR_SECONDS`.
+const SPAWN_INTERVAL_PER_WAVE_REDUCTION: f32 = 0.02;
+/// Floor the Wave-scaled spawn interval never drops below.
+const SPAWN_INTERVAL_FLOOR_SECONDS: f32 = 0.3;
 /// Health multiplier applied to every Enemy in Wave `n`: `1 + n * this`.
-const WAVE_HEALTH_SCALING_PER_WAVE: f32 = 0.1;
-/// Extra Enemy beyond the flat `5` every Wave adds one of, per Wave
-/// number: Wave `n` spawns `WAVE_BASE_ENEMY_COUNT + n` Enemy total.
+const WAVE_HEALTH_SCALING_PER_WAVE: f32 = 0.15;
+/// Enemy count every Wave starts from before Wave growth.
 const WAVE_BASE_ENEMY_COUNT: u32 = 5;
+/// Quadratic coefficient of Enemy count growth: Wave `n` spawns
+/// `WAVE_BASE_ENEMY_COUNT + n + floor(WAVE_ENEMY_COUNT_GROWTH * n * n)`
+/// Enemy total, so count grows super-linearly and later Waves spike.
+const WAVE_ENEMY_COUNT_GROWTH: f32 = 0.1;
 /// A Boss Enemy is appended to every Wave whose number is a multiple
 /// of this (Wave 5, 10, 15, ...).
 const BOSS_WAVE_INTERVAL: u32 = 5;
@@ -729,13 +738,15 @@ impl Simulation {
         self.wave_in_progress
     }
 
-    /// Starts Wave `wave_number()`: queues `WAVE_BASE_ENEMY_COUNT + n`
-    /// Enemy (mixed Grunt/Runner/Tank, see `WAVE_ENEMY_KIND_CYCLE`),
-    /// plus one Boss appended last on every Wave that's a multiple of
-    /// `BOSS_WAVE_INTERVAL`, to spawn one at a time,
-    /// `SPAWN_INTERVAL_SECONDS` apart, each with Health scaled by
-    /// `1 + n * WAVE_HEALTH_SCALING_PER_WAVE`. Rejected while the
-    /// current Wave is still spawning or has any Enemy alive.
+    /// Starts Wave `wave_number()`: queues
+    /// `WAVE_BASE_ENEMY_COUNT + n` (plus quadratic growth, bounded by
+    /// `EnemyKind` cycle) Enemy (mixed Grunt/Runner/Tank, see
+    /// `WAVE_ENEMY_KIND_CYCLE`), plus one Boss appended last on every
+    /// Wave that's a multiple of `BOSS_WAVE_INTERVAL`, to spawn one at
+    /// a time, `SPAWN_INTERVAL_SECONDS` (Wave-scaled) apart, each with
+    /// Health scaled by `1 + n * WAVE_HEALTH_SCALING_PER_WAVE`.
+    /// Rejected while the current Wave is still spawning or has any
+    /// Enemy alive.
     pub fn start_next_wave(&mut self) -> Result<(), WaveError> {
         if self.outcome.is_some() {
             return Err(WaveError::GameOver);
@@ -743,8 +754,7 @@ impl Simulation {
         if self.wave_in_progress {
             return Err(WaveError::WaveInProgress);
         }
-        let count = WAVE_BASE_ENEMY_COUNT + self.wave_number;
-        self.spawn_queue = (0..count)
+        self.spawn_queue = (0..self.wave_enemy_count())
             .map(|i| WAVE_ENEMY_KIND_CYCLE[i as usize % WAVE_ENEMY_KIND_CYCLE.len()])
             .collect();
         if self.wave_number % BOSS_WAVE_INTERVAL == 0 {
@@ -753,6 +763,22 @@ impl Simulation {
         self.spawn_timer = 0.0;
         self.wave_in_progress = true;
         Ok(())
+    }
+
+    /// Total Enemy count (pre-Boss) the current Wave spawns: base plus
+    /// linear and quadratic growth in the Wave number, so it climbs
+    /// super-linearly and later Waves spike.
+    fn wave_enemy_count(&self) -> u32 {
+        let n = self.wave_number as f32;
+        let quadratic = (WAVE_ENEMY_COUNT_GROWTH * n * n).floor() as u32;
+        WAVE_BASE_ENEMY_COUNT + self.wave_number + quadratic
+    }
+
+    /// Seconds between Enemy spawns for the current Wave: base interval
+    /// shrinking each Wave, never below `SPAWN_INTERVAL_FLOOR_SECONDS`.
+    fn current_spawn_interval(&self) -> f32 {
+        (SPAWN_INTERVAL_SECONDS - self.wave_number as f32 * SPAWN_INTERVAL_PER_WAVE_REDUCTION)
+            .max(SPAWN_INTERVAL_FLOOR_SECONDS)
     }
 
     /// Health an Enemy spawned in the current Wave should have: base
@@ -898,7 +924,7 @@ impl Simulation {
             };
             let health = self.current_wave_enemy_health(kind);
             self.spawn_enemy_with_health(kind, health);
-            self.spawn_timer += SPAWN_INTERVAL_SECONDS;
+            self.spawn_timer += self.current_spawn_interval();
         }
     }
 
@@ -1595,6 +1621,7 @@ mod tests {
     fn selling_an_upgraded_tower_refunds_seventy_percent_of_purchase_plus_upgrade_spend() {
         let mut sim = Simulation::new();
         let pos = CellPos::new(5, 5);
+        sim.gold = 100_000;
         sim.place_tower(pos, TowerKind::Cannon).unwrap();
         let upgrade_cost = sim.upgrade_cost_at(pos).unwrap();
         sim.upgrade_tower(pos).unwrap();
@@ -1612,8 +1639,10 @@ mod tests {
         fn assert_wave_matches_formula_then_force_complete(sim: &mut Simulation, n: u32) {
             assert_eq!(sim.wave_number(), n);
             sim.start_next_wave().unwrap();
+            let quadratic = (WAVE_ENEMY_COUNT_GROWTH * n as f32 * n as f32).floor() as u32;
             let expected_count = WAVE_BASE_ENEMY_COUNT
                 + n
+                + quadratic
                 + if n % BOSS_WAVE_INTERVAL == 0 { 1 } else { 0 };
             assert_eq!(sim.spawn_queue.len() as u32, expected_count);
 
