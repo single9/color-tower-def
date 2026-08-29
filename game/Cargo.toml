@@ -1,0 +1,8 @@
+[package]
+name = "game"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+simulation = { path = "../simulation" }
+bevy = "0.15"
