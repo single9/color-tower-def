@@ -7,6 +7,7 @@
 ## 玩法概觀
 
 - 每個 Level 有固定的 Obstacle 佈局,Enemy 會沿著即時計算的最短 Path 從 Spawn 走到 Goal。放置 Tower 若會完全封死 Path 則會被拒絕。
+- 放置操作:滑鼠是 hover 看預覽、左鍵單擊放置;手機/平板是兩段式——第一下先選定 Cell(該格顯示半透明的 Tower 與 Path/Range 預覽,尚未扣 Gold),再點同一格才確認放置,點別格則是改選位置(見 [ADR-0006](docs/adr/0006-two-step-tower-placement-on-touch.md))。
 - 三種 Tower:**Cannon**(高傷害、低射速)、**Gatling**(低傷害、高射速)、**Frost**(不攻擊,持續降速 Range 內的 Enemy)。Tower 可升級至 Tier 3,主要數值逐級提升 30%;升級與賣出前會跳出確認對話框,避免誤觸。
 - 四種 Enemy:**Grunt**(中血中速)、**Runner**(低血高速)、**Tank**(高血低速),以及每 5 個 Wave 額外出現一次的 **Boss**(極高血量,目前無特殊機制)。
 - 每個 Level 15 個 Wave,通過即進入下個 Level(Tower 自動賣出退還 70%,Gold/Lives 沿用);通過最後一個 Level 的全部 Wave 即 Victory,Lives 歸零則 Defeat。

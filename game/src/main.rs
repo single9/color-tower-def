@@ -37,6 +37,9 @@ fn main() {
         .insert_resource(SelectedTower(None))
         .insert_resource(CommandPalette::default())
         .insert_resource(PendingConfirm(None))
+        .insert_resource(PendingPlacement(None))
+        .insert_resource(PreviewTarget(None))
+        .insert_resource(LastTouchAt(None))
         .add_systems(
             Startup,
             (
@@ -51,8 +54,10 @@ fn main() {
         .add_systems(
             Update,
             (
-                select_tower_kind,
-                interact_with_grid,
+                // Grouped so the whole Update list stays inside Bevy's
+                // 20-system tuple limit; `.chain()` keeps them running
+                // in this order all the same.
+                (track_touch_activity, select_tower_kind, interact_with_grid).chain(),
                 draw_range_rings,
                 handle_tower_panel_buttons,
                 sync_tower_info_panel,
@@ -102,6 +107,12 @@ struct TowerAt(CellPos);
 /// be cleared before redrawing each frame.
 #[derive(Component)]
 struct PathPreviewTile;
+
+/// Marks the translucent "ghost" Tower drawn on the Cell awaiting
+/// placement confirmation (see `PendingPlacement`), cleared and
+/// redrawn each frame like `PathPreviewTile`.
+#[derive(Component)]
+struct PlacementGhost;
 
 /// Marks a live Enemy sprite, cleared and redrawn from `simulation`
 /// state every frame (mirrors `PathPreviewTile`'s approach).
@@ -178,6 +189,36 @@ struct CommandPalette {
     input: String,
     message: Option<String>,
 }
+
+/// The Cell a touch tap has picked but not yet committed: the first tap
+/// of the two-step touch placement flow puts the Cell here (drawn as a
+/// translucent ghost Tower plus its Path/Range preview), a second tap on
+/// the same Cell places for real. `None` when nothing is awaiting
+/// confirmation — which is always the case for mouse input, where hover
+/// already previews a placement before the click commits it.
+#[derive(Resource, Default)]
+struct PendingPlacement(Option<CellPos>);
+
+/// The Cell this frame's placement previews are drawn for: the pending
+/// Cell if there is one, otherwise whatever the cursor (or a held touch)
+/// is over. Published by `interact_with_grid`, which computes it anyway
+/// for the Path overlay, so `draw_range_rings` can put its ring on the
+/// same Cell without redoing the window → world → Cell conversion.
+#[derive(Resource, Default)]
+struct PreviewTarget(Option<CellPos>);
+
+/// Time (seconds since app start) of the most recent touch input, or
+/// `None` until the first touch — on a mouse-only device this stays
+/// `None` and never affects anything. See `TOUCH_MOUSE_SUPPRESSION_SECS`.
+#[derive(Resource, Default)]
+struct LastTouchAt(Option<f32>);
+
+/// How long after a touch mouse input is ignored. Browsers on touch
+/// devices replay every tap as a synthetic mouse click a moment after
+/// the finger lifts; without this window that replay would land on the
+/// Cell the tap has just pended and place the Tower straight away,
+/// collapsing the two-step flow back into one.
+const TOUCH_MOUSE_SUPPRESSION_SECS: f32 = 1.0;
 
 /// The Command Palette's root Node, toggled between `Visibility::Visible`
 /// and `Visibility::Hidden` to show/hide the whole bar.
@@ -273,6 +314,14 @@ fn tower_color(kind: TowerKind) -> Color {
 
 fn path_preview_color() -> Color {
     Color::srgba(1.0, 1.0, 0.0, 0.35) // translucent yellow
+}
+
+/// The Tower Kind's own color, faded down for the ghost drawn on a Cell
+/// that is only awaiting confirmation. Low enough alpha that the Cell
+/// underneath still shows through, so it can't be mistaken for a Tower
+/// that is already paid for and placed.
+fn placement_ghost_color(kind: TowerKind) -> Color {
+    tower_color(kind).with_alpha(0.4)
 }
 
 fn enemy_color(kind: EnemyKind) -> Color {
@@ -493,59 +542,208 @@ fn hovered_cell(
 ) -> Option<CellPos> {
     let window = windows.get_single().ok()?;
     let cursor = window.cursor_position().or(touch_position)?;
+    screen_to_cell(camera, cursor)
+}
+
+/// Which Cell (if any) a window-space position falls on. Shared by
+/// `hovered_cell` and the touch-tap handling in `interact_with_grid`,
+/// which needs the position of the touch that was *just pressed* rather
+/// than whichever one is currently held.
+fn screen_to_cell(camera: &Query<(&Camera, &GlobalTransform)>, position: Vec2) -> Option<CellPos> {
     let (camera, camera_transform) = camera.get_single().ok()?;
-    let world = camera.viewport_to_world_2d(camera_transform, cursor).ok()?;
+    let world = camera.viewport_to_world_2d(camera_transform, position).ok()?;
     world_to_cell(world)
 }
 
-/// Single seam between mouse input and the `simulation` crate: figures
-/// out which Cell the cursor is over, redraws the Path preview for it,
-/// and on a left click either selects an existing Tower (opening its
-/// info panel) or places a new one (subject to the Blocking Rule
-/// enforced entirely inside `sim`).
+/// Records when a touch was last active, so `interact_with_grid` can
+/// ignore the synthetic mouse clicks a browser replays after each tap
+/// (see `TOUCH_MOUSE_SUPPRESSION_SECS`).
+fn track_touch_activity(
+    time: Res<Time>,
+    touches: Res<Touches>,
+    mut last_touch: ResMut<LastTouchAt>,
+) {
+    if touches.iter().next().is_some() || touches.any_just_released() {
+        last_touch.0 = Some(time.elapsed_secs());
+    }
+}
+
+/// Whether a touch is still recent enough that mouse input should be
+/// treated as its synthetic replay rather than a real click.
+fn mouse_suppressed_by_touch(last_touch: &LastTouchAt, time: &Time) -> bool {
+    last_touch
+        .0
+        .is_some_and(|at| time.elapsed_secs() - at < TOUCH_MOUSE_SUPPRESSION_SECS)
+}
+
+/// What a touch tap on a Grid Cell means, given whichever Cell (if any)
+/// is already awaiting confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapOutcome {
+    /// The Cell holds a Tower: open its info panel.
+    SelectTower,
+    /// First tap on a placeable Cell: pick the position without
+    /// committing to it, so the player can see the Path/Range it would
+    /// produce before paying for it.
+    Pend,
+    /// Second tap on the Cell already pending: place the Tower.
+    Place,
+    /// Nothing to pick here (Obstacle/Spawn/Goal): drop whatever was
+    /// pending or selected.
+    Clear,
+}
+
+/// The two-step touch placement rule, kept pure so it can be unit-tested
+/// without standing up a Bevy `App`.
+fn resolve_tap(
+    pending: Option<CellPos>,
+    tapped: CellPos,
+    has_tower: bool,
+    buildable: bool,
+) -> TapOutcome {
+    if has_tower {
+        TapOutcome::SelectTower
+    } else if !buildable {
+        TapOutcome::Clear
+    } else if pending == Some(tapped) {
+        TapOutcome::Place
+    } else {
+        TapOutcome::Pend
+    }
+}
+
+/// Single seam between pointer input and the `simulation` crate: figures
+/// out which Cell the player is aiming at, redraws the Path preview for
+/// it, and either selects an existing Tower (opening its info panel) or
+/// places a new one (subject to the Blocking Rule enforced entirely
+/// inside `sim`).
+///
+/// Mouse and touch commit differently, because a finger has no hover
+/// state: with a mouse, hovering already previews the placement and the
+/// click commits it, while a touch tap only reaches the Cell it lands
+/// on at the moment it lands. So touch is two-step (see
+/// `PendingPlacement`): the first tap picks the Cell and shows it as a
+/// translucent ghost Tower with its Path/Range preview, and a second tap
+/// on that same Cell places for real.
 fn interact_with_grid(
     mut commands: Commands,
     windows: Query<&Window>,
     camera: Query<(&Camera, &GlobalTransform)>,
     mouse: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
+    time: Res<Time>,
+    last_touch: Res<LastTouchAt>,
     mut sim: ResMut<SimState>,
     selected: Res<SelectedTowerKind>,
     mut selected_tower: ResMut<SelectedTower>,
+    mut pending: ResMut<PendingPlacement>,
+    mut preview_target: ResMut<PreviewTarget>,
+    pending_confirm: Res<PendingConfirm>,
     preview_tiles: Query<Entity, With<PathPreviewTile>>,
+    ghosts: Query<Entity, With<PlacementGhost>>,
 ) {
     for entity in &preview_tiles {
+        commands.entity(entity).despawn();
+    }
+    for entity in &ghosts {
         commands.entity(entity).despawn();
     }
 
     if sim.0.outcome().is_some() {
         // The result overlay is showing: no Grid click has any effect.
+        pending.0 = None;
+        preview_target.0 = None;
         return;
     }
 
-    let Some(hovered) = hovered_cell(&windows, &camera, touches.first_pressed_position()) else {
-        return;
-    };
+    let hovered = hovered_cell(&windows, &camera, touches.first_pressed_position());
 
-    if !sim.0.has_tower(hovered) && sim.0.grid().kind_at(hovered) == CellKind::Buildable {
-        if let Some(path) = sim.0.preview_path_if_placed(hovered) {
-            for pos in path {
-                commands.spawn((
-                    Sprite {
-                        color: path_preview_color(),
-                        custom_size: Some(Vec2::splat(CELL_SIZE_PX - 1.0)),
-                        ..default()
-                    },
-                    Transform::from_translation(cell_world_pos(pos).with_z(0.5)),
-                    PathPreviewTile,
-                ));
+    // A pending Cell outranks the hovered one: on touch the finger has
+    // usually lifted by the time the player is reading the preview, so
+    // without this the Path/Range preview would blink out with it.
+    preview_target.0 = pending.0.or(hovered);
+
+    if let Some(target) = preview_target.0 {
+        if !sim.0.has_tower(target) && sim.0.grid().kind_at(target) == CellKind::Buildable {
+            if let Some(path) = sim.0.preview_path_if_placed(target) {
+                for pos in path {
+                    commands.spawn((
+                        Sprite {
+                            color: path_preview_color(),
+                            custom_size: Some(Vec2::splat(CELL_SIZE_PX - 1.0)),
+                            ..default()
+                        },
+                        Transform::from_translation(cell_world_pos(pos).with_z(0.5)),
+                        PathPreviewTile,
+                    ));
+                }
             }
         }
     }
 
-    if !mouse.just_pressed(MouseButton::Left) && !touches.any_just_pressed() {
+    // The ghost Tower: the real thing's color and size but see-through, so
+    // a pending Cell never reads as an already-placed Tower.
+    if let Some(target) = pending.0 {
+        commands.spawn((
+            Sprite {
+                color: placement_ghost_color(selected.0),
+                custom_size: Some(Vec2::splat(CELL_SIZE_PX - 1.0)),
+                ..default()
+            },
+            Transform::from_translation(cell_world_pos(target).with_z(0.75)),
+            PlacementGhost,
+        ));
+    }
+
+    // The Upgrade/Sell confirmation dialog covers the Grid: while it's
+    // up its buttons own every tap and click, so none of them reach the
+    // Cell that happens to sit under the dialog.
+    if pending_confirm.0.is_some() {
         return;
     }
+
+    // Touch taps go through the two-step flow. A tap that misses the
+    // Grid entirely (the sidebar, say) leaves the pending Cell alone, so
+    // switching Tower Kind mid-placement just recolors the ghost.
+    if let Some(tapped) = touches
+        .iter_just_pressed()
+        .next()
+        .and_then(|touch| screen_to_cell(&camera, touch.position()))
+    {
+        match resolve_tap(
+            pending.0,
+            tapped,
+            sim.0.has_tower(tapped),
+            sim.0.grid().kind_at(tapped) == CellKind::Buildable,
+        ) {
+            TapOutcome::SelectTower => {
+                selected_tower.0 = Some(tapped);
+                pending.0 = None;
+            }
+            TapOutcome::Pend => {
+                selected_tower.0 = None;
+                pending.0 = Some(tapped);
+            }
+            TapOutcome::Place => {
+                selected_tower.0 = None;
+                pending.0 = None;
+                place_tower(&mut commands, &mut sim.0, tapped, selected.0);
+            }
+            TapOutcome::Clear => {
+                selected_tower.0 = None;
+                pending.0 = None;
+            }
+        }
+        return;
+    }
+
+    if !mouse.just_pressed(MouseButton::Left) || mouse_suppressed_by_touch(&last_touch, &time) {
+        return;
+    }
+
+    let Some(hovered) = hovered else {
+        return;
+    };
 
     if sim.0.has_tower(hovered) {
         selected_tower.0 = Some(hovered);
@@ -558,15 +756,22 @@ fn interact_with_grid(
     // stray click off a Tower always clears its Range ring instead of
     // leaving it stuck showing.
     selected_tower.0 = None;
-    if sim.0.place_tower(hovered, selected.0).is_ok() {
+    place_tower(&mut commands, &mut sim.0, hovered, selected.0);
+}
+
+/// Places a Tower and spawns its sprite, if `sim` accepts the placement
+/// (Blocking Rule, Gold, Cell Kind). A rejected placement is simply
+/// ignored, as it has been since the Grid was click-only.
+fn place_tower(commands: &mut Commands, sim: &mut Simulation, pos: CellPos, kind: TowerKind) {
+    if sim.place_tower(pos, kind).is_ok() {
         commands.spawn((
             Sprite {
-                color: tower_color(selected.0),
+                color: tower_color(kind),
                 custom_size: Some(Vec2::splat(CELL_SIZE_PX - 1.0)),
                 ..default()
             },
-            Transform::from_translation(cell_world_pos(hovered).with_z(1.0)),
-            TowerAt(hovered),
+            Transform::from_translation(cell_world_pos(pos).with_z(1.0)),
+            TowerAt(pos),
         ));
     }
 }
@@ -575,18 +780,17 @@ fn interact_with_grid(
 /// Tower's Range actually reaches in Cell units, rather than reading a
 /// bare number off the info panel:
 /// - a Tower selected for inspection shows its current (Tiered) Range;
-/// - otherwise, hovering a Buildable Cell previews the selected Tower
-///   Kind's Tier 1 Range for that placement.
+/// - otherwise, the Cell awaiting touch confirmation — or, failing that,
+///   a hovered Buildable Cell — previews the selected Tower Kind's Tier 1
+///   Range for that placement.
 /// Gizmos redraw every frame with no despawn bookkeeping needed, unlike
 /// the Sprite-based overlays elsewhere in this file.
 fn draw_range_rings(
     mut gizmos: Gizmos,
-    windows: Query<&Window>,
-    camera: Query<(&Camera, &GlobalTransform)>,
-    touches: Res<Touches>,
     sim: Res<SimState>,
     selected_tower: Res<SelectedTower>,
     selected_kind: Res<SelectedTowerKind>,
+    preview_target: Res<PreviewTarget>,
 ) {
     if let Some(pos) = selected_tower.0 {
         if let Some(stats) = sim.0.tower_stats_at(pos) {
@@ -600,15 +804,15 @@ fn draw_range_rings(
         return;
     }
 
-    let Some(hovered) = hovered_cell(&windows, &camera, touches.first_pressed_position()) else {
+    let Some(target) = preview_target.0 else {
         return;
     };
-    if sim.0.has_tower(hovered) || sim.0.grid().kind_at(hovered) != CellKind::Buildable {
+    if sim.0.has_tower(target) || sim.0.grid().kind_at(target) != CellKind::Buildable {
         return;
     }
 
     let range = selected_kind.0.range(TowerTier::One);
-    let center = cell_world_pos(hovered).truncate();
+    let center = cell_world_pos(target).truncate();
     gizmos.circle_2d(center, range * CELL_SIZE_PX, range_ring_color());
 }
 
@@ -750,6 +954,7 @@ fn tick_simulation(
     mut commands: Commands,
     time: Res<Time>,
     mut sim: ResMut<SimState>,
+    mut pending: ResMut<PendingPlacement>,
     towers: Query<Entity, With<TowerAt>>,
 ) {
     let events = sim.0.tick(time.delta_secs());
@@ -762,6 +967,9 @@ fn tick_simulation(
         for entity in &towers {
             commands.entity(entity).despawn();
         }
+        // The new Level's Grid has its own Obstacle layout, so a Cell
+        // picked on the old one means nothing now.
+        pending.0 = None;
     }
 }
 
@@ -980,6 +1188,7 @@ fn handle_reset_button(
     mut sim: ResMut<SimState>,
     mut selected_tower: ResMut<SelectedTower>,
     mut selected_kind: ResMut<SelectedTowerKind>,
+    mut pending: ResMut<PendingPlacement>,
     interactions: Query<&Interaction, (With<ResetButton>, Changed<Interaction>)>,
     towers: Query<Entity, With<TowerAt>>,
     enemies: Query<Entity, With<EnemyMarker>>,
@@ -990,6 +1199,7 @@ fn handle_reset_button(
             sim.0 = Simulation::new();
             selected_tower.0 = None;
             selected_kind.0 = TowerKind::Cannon;
+            pending.0 = None;
             for entity in &towers {
                 commands.entity(entity).despawn();
             }
@@ -1065,6 +1275,7 @@ fn type_into_command_palette(
     mut key_events: EventReader<KeyboardInput>,
     mut palette: ResMut<CommandPalette>,
     mut sim: ResMut<SimState>,
+    mut pending: ResMut<PendingPlacement>,
     towers: Query<Entity, With<TowerAt>>,
 ) {
     if !palette.open {
@@ -1088,7 +1299,13 @@ fn type_into_command_palette(
             }
             Key::Enter => {
                 let command = std::mem::take(&mut palette.input);
-                palette.message = Some(run_command(&mut commands, &mut sim.0, &towers, command.trim()));
+                palette.message = Some(run_command(
+                    &mut commands,
+                    &mut sim.0,
+                    &mut pending,
+                    &towers,
+                    command.trim(),
+                ));
             }
             Key::Escape => palette.open = false,
             _ => {}
@@ -1103,6 +1320,7 @@ fn type_into_command_palette(
 fn run_command(
     commands: &mut Commands,
     sim: &mut Simulation,
+    pending: &mut PendingPlacement,
     towers: &Query<Entity, With<TowerAt>>,
     command: &str,
 ) -> String {
@@ -1117,6 +1335,7 @@ fn run_command(
                 for entity in towers {
                     commands.entity(entity).despawn();
                 }
+                pending.0 = None;
                 format!("Jumped to Level {n}/{}", simulation::LEVEL_COUNT)
             }
             _ => format!("Usage: level <1..{}>", simulation::LEVEL_COUNT),
@@ -1328,5 +1547,50 @@ fn handle_confirm_dialog(
         pending.0 = None;
     } else if dismissed {
         pending.0 = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CELL: CellPos = CellPos { x: 3, y: 4 };
+    const OTHER_CELL: CellPos = CellPos { x: 7, y: 2 };
+
+    #[test]
+    fn first_tap_on_a_buildable_cell_only_pends_it() {
+        assert_eq!(resolve_tap(None, CELL, false, true), TapOutcome::Pend);
+    }
+
+    #[test]
+    fn second_tap_on_the_pending_cell_places() {
+        assert_eq!(
+            resolve_tap(Some(CELL), CELL, false, true),
+            TapOutcome::Place
+        );
+    }
+
+    #[test]
+    fn tapping_another_cell_moves_the_pending_cell_instead_of_placing() {
+        assert_eq!(
+            resolve_tap(Some(CELL), OTHER_CELL, false, true),
+            TapOutcome::Pend
+        );
+    }
+
+    #[test]
+    fn tapping_a_tower_selects_it_even_while_a_cell_is_pending() {
+        assert_eq!(
+            resolve_tap(Some(CELL), OTHER_CELL, true, false),
+            TapOutcome::SelectTower
+        );
+    }
+
+    #[test]
+    fn tapping_an_unbuildable_cell_clears_the_pending_cell() {
+        assert_eq!(
+            resolve_tap(Some(CELL), OTHER_CELL, false, false),
+            TapOutcome::Clear
+        );
     }
 }
