@@ -1,2 +1,5 @@
+[build]
+public_url = "/color-tower-def/"
+
 [serve]
 port = 8787
