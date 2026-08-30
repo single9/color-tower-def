@@ -41,7 +41,7 @@ _Avoid_: Stage, Map(Map 是 Level 在 Grid 上的具體呈現,Level 才是遊戲
 ### 防禦塔
 
 **Tower**:
-玩家花費 Gold 放置在 Buildable Cell 上的防禦單位,會攻擊進入其 Range 的 Enemy,同時也是阻擋 Path 的障礙物。
+玩家花費 Gold 放置在 Buildable Cell 上的防禦單位,會攻擊進入其 Range 的 Enemy,同時也是阻擋 Path 的障礙物。放置方式依輸入裝置而異:滑鼠是 hover 預覽、單擊放置;觸控是兩段式——第一下只選定 Cell(顯示半透明的 ghost Tower 與預覽),第二下點同一個 Cell 才真的放置並扣 Gold(見 ADR-0006)。
 _Avoid_: Turret, Defender
 
 **Tower Kind**:
@@ -54,7 +54,7 @@ Tower 的類型,決定其攻擊方式與數值傾向。目前有三種:
 _Avoid_: Red Tower / Green Tower / Blue Tower(顏色是 Tower Kind 的視覺呈現,不是名稱本身)
 
 **Range**:
-Tower 的有效作用半徑。Cannon 與 Gatling 在 Range 內鎖定 Enemy 發射 Projectile;Frost 對 Range 內所有 Enemy 持續套用 Slow Aura。在 Grid 上以半透明圓圈視覺化:選中已放置的 Tower 時顯示其目前 Tier 的實際 Range,放置新 Tower 時(hover 於 Buildable Cell)則預覽該 Kind 在 Tier 1 的 Range(見 ADR-0004)。
+Tower 的有效作用半徑。Cannon 與 Gatling 在 Range 內鎖定 Enemy 發射 Projectile;Frost 對 Range 內所有 Enemy 持續套用 Slow Aura。在 Grid 上以半透明圓圈視覺化:選中已放置的 Tower 時顯示其目前 Tier 的實際 Range,放置新 Tower 時(滑鼠 hover 於 Buildable Cell,或觸控下已選定但尚未確認的 Cell)則預覽該 Kind 在 Tier 1 的 Range(見 ADR-0004、ADR-0006)。
 
 **Projectile**:
 Cannon 或 Gatling 發射後鎖定 Enemy 並跟隨其移動的攻擊實體,命中即扣除 Enemy 的 Health,保證命中。
