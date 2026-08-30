@@ -483,13 +483,16 @@ fn despawn_tower_sprite(commands: &mut Commands, towers: &Query<(Entity, &TowerA
 /// Which Cell (if any) the cursor is currently hovering, shared by
 /// `interact_with_grid` (Path preview / placement / selection) and
 /// `draw_range_rings` (placement Range preview) so both apply the same
-/// window/camera → world → Cell conversion.
+/// window/camera → world → Cell conversion. Falls back to the active
+/// touch point (logical coords, same space as `cursor_position`) on
+/// touch-only devices where no cursor exists.
 fn hovered_cell(
     windows: &Query<&Window>,
     camera: &Query<(&Camera, &GlobalTransform)>,
+    touch_position: Option<Vec2>,
 ) -> Option<CellPos> {
     let window = windows.get_single().ok()?;
-    let cursor = window.cursor_position()?;
+    let cursor = window.cursor_position().or(touch_position)?;
     let (camera, camera_transform) = camera.get_single().ok()?;
     let world = camera.viewport_to_world_2d(camera_transform, cursor).ok()?;
     world_to_cell(world)
@@ -505,6 +508,7 @@ fn interact_with_grid(
     windows: Query<&Window>,
     camera: Query<(&Camera, &GlobalTransform)>,
     mouse: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     mut sim: ResMut<SimState>,
     selected: Res<SelectedTowerKind>,
     mut selected_tower: ResMut<SelectedTower>,
@@ -519,7 +523,7 @@ fn interact_with_grid(
         return;
     }
 
-    let Some(hovered) = hovered_cell(&windows, &camera) else {
+    let Some(hovered) = hovered_cell(&windows, &camera, touches.first_pressed_position()) else {
         return;
     };
 
@@ -539,7 +543,7 @@ fn interact_with_grid(
         }
     }
 
-    if !mouse.just_pressed(MouseButton::Left) {
+    if !mouse.just_pressed(MouseButton::Left) && !touches.any_just_pressed() {
         return;
     }
 
@@ -579,6 +583,7 @@ fn draw_range_rings(
     mut gizmos: Gizmos,
     windows: Query<&Window>,
     camera: Query<(&Camera, &GlobalTransform)>,
+    touches: Res<Touches>,
     sim: Res<SimState>,
     selected_tower: Res<SelectedTower>,
     selected_kind: Res<SelectedTowerKind>,
@@ -595,7 +600,7 @@ fn draw_range_rings(
         return;
     }
 
-    let Some(hovered) = hovered_cell(&windows, &camera) else {
+    let Some(hovered) = hovered_cell(&windows, &camera, touches.first_pressed_position()) else {
         return;
     };
     if sim.0.has_tower(hovered) || sim.0.grid().kind_at(hovered) != CellKind::Buildable {
