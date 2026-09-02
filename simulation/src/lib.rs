@@ -187,7 +187,18 @@ const PROJECTILE_SPEED_CELLS_PER_SEC: f32 = 8.0;
 const PROJECTILE_HIT_DISTANCE_CELLS: f32 = 0.25;
 
 /// Gold economy balance numbers pending playtesting.
-const STARTING_GOLD: i32 = 180;
+///
+/// Raised from 180 after a real-engine (not closed-form) optimal-play
+/// simulation showed the original value bought only a single Cannon
+/// at Wave 1's start — the second (still un-marked-up, since
+/// `fibonacci(1) == fibonacci(2) == 1`) Cannon a real player needs to
+/// cover the path's far half stayed unaffordable until a couple of
+/// Enemy had already leaked. 200 buys both from the opening whistle:
+/// `optimal_play_clears_wave_one_with_no_leaks` locks this in. The
+/// bump is small enough to barely register by the late-game economy
+/// the total-Tower-count price markup (see `TOWER_COUNT_PRICE_GROWTH_RATE`)
+/// already governs.
+const STARTING_GOLD: i32 = 200;
 const CANNON_PRICE: i32 = 100;
 const GATLING_PRICE: i32 = 90;
 const FROST_PRICE: i32 = 120;
