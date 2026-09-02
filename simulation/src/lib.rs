@@ -468,15 +468,18 @@ impl Enemy {
     }
 }
 
-/// Per-Tower runtime state. `purchase_price` is fixed at placement and
-/// drives upgrade cost; `gold_spent` accumulates purchase price plus
-/// every upgrade paid, and drives the sell refund.
+/// Per-Tower runtime state. `gold_spent` accumulates the price actually
+/// paid to place this Tower (including any same-Kind markup — see
+/// `Simulation::tower_price`) plus every upgrade paid, and drives the
+/// sell refund. Upgrade cost, by contrast, is deliberately *not*
+/// derived from `gold_spent`: it always reads `kind.price()`, the flat
+/// base price, so a Tower bought at a markup doesn't also upgrade for
+/// more — the same-Kind markup is a placement-time cost only.
 #[derive(Debug, Clone, Copy)]
 struct TowerRuntime {
     kind: TowerKind,
     tier: TowerTier,
     cooldown_remaining: f32,
-    purchase_price: i32,
     gold_spent: i32,
 }
 
@@ -510,11 +513,13 @@ fn fibonacci(n: u32) -> u64 {
     previous
 }
 
-/// Gold cost of one upgrade step: `UPGRADE_COST_FRACTION` of the
-/// Tower's original purchase price, rounded to the nearest whole
-/// Gold (.5 away from zero), flat at every Tier transition.
-fn upgrade_cost(purchase_price: i32) -> i32 {
-    (purchase_price as f32 * UPGRADE_COST_FRACTION).round() as i32
+/// Gold cost of one upgrade step: `UPGRADE_COST_FRACTION` of the Tower
+/// Kind's flat base price (`TowerKind::price`, never the same-Kind
+/// markup a particular Tower may have actually paid), rounded to the
+/// nearest whole Gold (.5 away from zero), flat at every Tier
+/// transition.
+fn upgrade_cost(base_price: i32) -> i32 {
+    (base_price as f32 * UPGRADE_COST_FRACTION).round() as i32
 }
 
 /// Where an Enemy currently is, for the Bevy layer to render: it sits
@@ -635,7 +640,7 @@ impl Simulation {
         if runtime.tier.is_max() {
             return None;
         }
-        Some(upgrade_cost(runtime.purchase_price))
+        Some(upgrade_cost(runtime.kind.price()))
     }
 
     /// The current shortest Path from Spawn to Goal around all placed
@@ -706,7 +711,6 @@ impl Simulation {
                 kind,
                 tier: TowerTier::One,
                 cooldown_remaining: 0.0,
-                purchase_price: price,
                 gold_spent: price,
             },
         );
@@ -725,7 +729,7 @@ impl Simulation {
         let Some(next_tier) = runtime.tier.next() else {
             return Err(UpgradeError::AlreadyMaxTier);
         };
-        let cost = upgrade_cost(runtime.purchase_price);
+        let cost = upgrade_cost(runtime.kind.price());
         if self.gold < cost {
             return Err(UpgradeError::InsufficientGold);
         }
@@ -1613,6 +1617,37 @@ mod tests {
             assert!(sim.sell_tower(CellPos::new(x, 1)));
         }
         assert_eq!(sim.tower_price(TowerKind::Cannon), base);
+    }
+
+    #[test]
+    fn upgrade_cost_ignores_the_same_kind_markup_a_tower_actually_paid() {
+        let mut sim = Simulation::new();
+        sim.gold = 1_000_000;
+
+        // A Cannon bought cheap (first of its Kind) ...
+        let cheap_pos = CellPos::new(1, 1);
+        sim.place_tower(cheap_pos, TowerKind::Cannon).unwrap();
+        let cheap_upgrade_cost = sim.upgrade_cost_at(cheap_pos).unwrap();
+
+        // ... and one bought at a steep same-Kind markup ...
+        for (i, x) in (2..=6).enumerate() {
+            sim.place_tower(CellPos::new(x, 1), TowerKind::Cannon)
+                .unwrap_or_else(|e| panic!("Cannon #{} should place cleanly: {e:?}", i + 2));
+        }
+        let marked_up_pos = CellPos::new(6, 1);
+        assert!(
+            sim.tower_price(TowerKind::Cannon) > TowerKind::Cannon.price(),
+            "the next Cannon purchase should already be marked up"
+        );
+        let marked_up_upgrade_cost = sim.upgrade_cost_at(marked_up_pos).unwrap();
+
+        // ... should both upgrade for the same flat cost, tied to the
+        // Kind's base price rather than what either Tower actually paid.
+        assert_eq!(cheap_upgrade_cost, marked_up_upgrade_cost);
+        assert_eq!(
+            cheap_upgrade_cost,
+            (TowerKind::Cannon.price() as f32 * UPGRADE_COST_FRACTION).round() as i32
+        );
     }
 
     #[test]
