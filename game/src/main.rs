@@ -101,7 +101,7 @@ struct TowerKindButton(TowerKind);
 
 /// Marks a Tower Kind button's label text, so `sync_tower_price_labels`
 /// can keep its displayed price in sync with `simulation` state — it
-/// climbs as more of that Kind gets placed (see `Simulation::tower_price`).
+/// climbs as more Tower overall get placed (see `Simulation::tower_price`).
 #[derive(Component)]
 struct TowerPriceLabel {
     display_name: &'static str,

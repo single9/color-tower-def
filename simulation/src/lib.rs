@@ -213,20 +213,22 @@ const UPGRADE_COST_FRACTION: f32 = 0.8;
 /// one — this rate roughly cancels that out instead of removing the
 /// upgrade-over-a-fresh-Tower discount entirely.
 const UPGRADE_COST_TIER_GROWTH_RATE: f32 = 0.3;
-/// How steeply a Tower Kind's price climbs with how many of that same
-/// Kind are already on the Grid: buying the `k`-th one of a Kind
-/// (1-indexed — the very first purchase is `k = 1`) costs
-/// `price() * (1 + this * ln(fibonacci(k)))`. `fibonacci(1) ==
-/// fibonacci(2) == 1`, so the first two of a Kind cost the same,
-/// un-marked-up price; from the third on the markup climbs, but the
-/// `ln` keeps its *growth itself* from compounding the way raw
-/// Fibonacci would — each further Tower still costs more, but the
-/// per-Tower increase levels off toward a fixed cap instead of
-/// accelerating, so spamming a single Kind is discouraged without ever
-/// being hard-capped. Selling one back lowers the price of the next
-/// purchase too, since this reads currently-placed count, not
-/// lifetime purchases.
-const SAME_KIND_PRICE_GROWTH_RATE: f32 = 0.25;
+/// How steeply every Tower's price climbs with how many Tower —
+/// *any* Kind — are already on the Grid: buying the `k`-th Tower
+/// overall (1-indexed — the very first purchase is `k = 1`) costs
+/// `kind.price() * (1 + this * ln(fibonacci(k)))`. `fibonacci(1) ==
+/// fibonacci(2) == 1`, so the first two Tower placed (of any Kind, in
+/// any combination) cost the same, un-marked-up price; from the third
+/// on the markup climbs, but the `ln` keeps its *growth itself* from
+/// compounding the way raw Fibonacci would — each further Tower still
+/// costs more, but the per-Tower increase levels off toward a fixed
+/// cap instead of accelerating. Reading total Tower count rather than
+/// per-Kind count means switching Kind doesn't dodge the markup, so
+/// blanketing the Grid in Tower is discouraged regardless of Kind
+/// mix, without ever being hard-capped. Selling one back lowers the
+/// price of the next purchase too, since this reads currently-placed
+/// count, not lifetime purchases.
+const TOWER_COUNT_PRICE_GROWTH_RATE: f32 = 0.25;
 /// Multiplier applied to a Tower's primary stat per Tier over Tier 1.
 const TIER_STAT_MULTIPLIER: f32 = 1.3;
 
@@ -492,12 +494,12 @@ impl Enemy {
 }
 
 /// Per-Tower runtime state. `gold_spent` accumulates the price actually
-/// paid to place this Tower (including any same-Kind markup — see
-/// `Simulation::tower_price`) plus every upgrade paid, and drives the
-/// sell refund. Upgrade cost, by contrast, is deliberately *not*
+/// paid to place this Tower (including any total-Tower-count markup —
+/// see `Simulation::tower_price`) plus every upgrade paid, and drives
+/// the sell refund. Upgrade cost, by contrast, is deliberately *not*
 /// derived from `gold_spent`: it always reads `kind.price()`, the flat
 /// base price, so a Tower bought at a markup doesn't also upgrade for
-/// more — the same-Kind markup is a placement-time cost only.
+/// more — the markup is a placement-time cost only.
 #[derive(Debug, Clone, Copy)]
 struct TowerRuntime {
     kind: TowerKind,
@@ -526,7 +528,7 @@ fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
 
 /// The `n`-th Fibonacci number, 1-indexed with `fibonacci(1) ==
 /// fibonacci(2) == 1` (so `n` must be at least 1) — feeds
-/// `tower_price`'s same-Kind markup.
+/// `tower_price`'s total-Tower-count markup.
 fn fibonacci(n: u32) -> u64 {
     debug_assert!(n >= 1, "fibonacci is 1-indexed");
     let (mut previous, mut current) = (1u64, 1u64);
@@ -537,8 +539,8 @@ fn fibonacci(n: u32) -> u64 {
 }
 
 /// Gold cost of upgrading to `target_tier`: the Tower Kind's flat base
-/// price (`TowerKind::price`, never the same-Kind markup a particular
-/// Tower may have actually paid) times `UPGRADE_COST_FRACTION`, scaled
+/// price (`TowerKind::price`, never the total-Tower-count markup a
+/// particular Tower may have actually paid) times `UPGRADE_COST_FRACTION`, scaled
 /// up per `UPGRADE_COST_TIER_GROWTH_RATE` for how far `target_tier` is
 /// past Tier 1 — so Tier 3 costs more to reach than Tier 2 did,
 /// rounded to the nearest whole Gold (.5 away from zero) at each step.
@@ -679,27 +681,25 @@ impl Simulation {
         self.shortest_path(self.grid.spawn(), Some(pos))
     }
 
-    /// How many Tower of `kind` are currently on the Grid — the count
-    /// `tower_price` scales off. Selling one back lowers this, and so
-    /// the price of the next purchase of that Kind.
-    fn count_of_kind(&self, kind: TowerKind) -> u32 {
-        self.towers
-            .values()
-            .filter(|runtime| runtime.kind == kind)
-            .count() as u32
+    /// How many Tower — of any Kind — are currently on the Grid, the
+    /// count `tower_price` scales off. Selling one back lowers this,
+    /// and so the price of the next purchase, regardless of Kind.
+    fn total_tower_count(&self) -> u32 {
+        self.towers.len() as u32
     }
 
     /// The Gold cost to place a fresh Tower of `kind` right now: its
-    /// base `TowerKind::price`, marked up per `SAME_KIND_PRICE_GROWTH_RATE`
-    /// — the first *and* second Tower of a Kind always cost exactly
-    /// `kind.price()`, since `fibonacci(1) == fibonacci(2) == 1`.
-    /// Public so the Bevy layer can label the sidebar's Tower Kind
-    /// buttons with the price the next click would pay.
+    /// base `TowerKind::price`, marked up per `TOWER_COUNT_PRICE_GROWTH_RATE`
+    /// for how many Tower of *any* Kind are already on the Grid — the
+    /// first and second Tower placed always cost exactly `kind.price()`,
+    /// since `fibonacci(1) == fibonacci(2) == 1`. Public so the Bevy
+    /// layer can label the sidebar's Tower Kind buttons with the price
+    /// the next click would pay.
     pub fn tower_price(&self, kind: TowerKind) -> i32 {
         // 1-indexed: placing this one would be the `ordinal`-th Tower
-        // of `kind` on the Grid.
-        let ordinal = self.count_of_kind(kind) + 1;
-        let multiplier = 1.0 + SAME_KIND_PRICE_GROWTH_RATE * (fibonacci(ordinal) as f32).ln();
+        // overall on the Grid.
+        let ordinal = self.total_tower_count() + 1;
+        let multiplier = 1.0 + TOWER_COUNT_PRICE_GROWTH_RATE * (fibonacci(ordinal) as f32).ln();
         (kind.price() as f32 * multiplier).round() as i32
     }
 
@@ -1587,32 +1587,32 @@ mod tests {
     }
 
     #[test]
-    fn the_first_two_of_a_kind_are_flat_priced_then_price_climbs_at_a_capped_rate() {
+    fn the_first_two_towers_overall_are_flat_priced_then_price_climbs_at_a_capped_rate() {
         let mut sim = Simulation::new();
         sim.gold = 1_000_000;
         let base = TowerKind::Cannon.price();
 
-        // fibonacci(1) == fibonacci(2) == 1: the first two Cannon cost
-        // the same, un-marked-up price.
+        // fibonacci(1) == fibonacci(2) == 1: the first two Tower placed
+        // overall cost the same, un-marked-up price.
         assert_eq!(sim.tower_price(TowerKind::Cannon), base);
         sim.place_tower(CellPos::new(1, 1), TowerKind::Cannon).unwrap();
         assert_eq!(
             sim.tower_price(TowerKind::Cannon),
             base,
-            "the second Cannon should still cost the base price"
+            "the second Tower overall should still cost the base price"
         );
         sim.place_tower(CellPos::new(2, 1), TowerKind::Cannon).unwrap();
 
-        // From the third Cannon on, price climbs every further purchase.
+        // From the third Tower on, price climbs every further purchase.
         let mut prices = vec![sim.tower_price(TowerKind::Cannon)];
-        assert!(prices[0] > base, "the third Cannon should cost more than the base price");
+        assert!(prices[0] > base, "the third Tower should cost more than the base price");
         for (i, x) in (3..=9).enumerate() {
             sim.place_tower(CellPos::new(x, 1), TowerKind::Cannon)
                 .unwrap_or_else(|e| panic!("Cannon #{} should place cleanly: {e:?}", i + 3));
             prices.push(sim.tower_price(TowerKind::Cannon));
         }
         for pair in prices.windows(2) {
-            assert!(pair[1] > pair[0], "price should keep rising as more of the same Kind are placed");
+            assert!(pair[1] > pair[0], "price should keep rising as more Tower overall are placed");
         }
 
         // A pure Fibonacci markup (no log) would widen the per-Tower
@@ -1627,14 +1627,8 @@ mod tests {
              (early step {early_step}, late step {late_step})"
         );
 
-        // A different Kind is unaffected by how many Cannon are placed.
-        assert_eq!(
-            sim.tower_price(TowerKind::Gatling),
-            TowerKind::Gatling.price()
-        );
-
-        // Selling back down to a single Cannon returns to the flat
-        // price (fibonacci(2) == 1 too, so one remaining Cannon still
+        // Selling back down to a single Tower returns to the flat
+        // price (fibonacci(2) == 1 too, so one remaining Tower still
         // prices the next purchase at the base rate).
         for x in (2..=9).rev() {
             assert!(sim.sell_tower(CellPos::new(x, 1)));
@@ -1643,16 +1637,52 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_cost_ignores_the_same_kind_markup_a_tower_actually_paid() {
+    fn switching_kind_does_not_dodge_the_tower_count_markup() {
         let mut sim = Simulation::new();
         sim.gold = 1_000_000;
 
-        // A Cannon bought cheap (first of its Kind) ...
+        // First two Tower overall, in different Kind, both flat-priced.
+        assert_eq!(sim.tower_price(TowerKind::Cannon), TowerKind::Cannon.price());
+        sim.place_tower(CellPos::new(1, 1), TowerKind::Cannon).unwrap();
+        assert_eq!(
+            sim.tower_price(TowerKind::Gatling),
+            TowerKind::Gatling.price(),
+            "the second Tower overall, even of a different Kind, should still be base price"
+        );
+        sim.place_tower(CellPos::new(2, 1), TowerKind::Gatling).unwrap();
+
+        // The third Tower is marked up for every Kind, not just the
+        // Kind already on the Grid.
+        assert!(sim.tower_price(TowerKind::Cannon) > TowerKind::Cannon.price());
+        let gatling_price_for_third = sim.tower_price(TowerKind::Gatling);
+        assert!(gatling_price_for_third > TowerKind::Gatling.price());
+
+        // Buying a Cannon (not a Gatling) still raises the price of the
+        // next Gatling — the markup reads total Tower count, so
+        // alternating Kind cannot dodge it.
+        sim.place_tower(CellPos::new(3, 1), TowerKind::Cannon).unwrap();
+        assert!(
+            sim.tower_price(TowerKind::Gatling) > gatling_price_for_third,
+            "a Cannon purchase should still raise the next Gatling's price"
+        );
+
+        // Selling any Tower — regardless of Kind — lowers the price of
+        // the next purchase of every Kind.
+        assert!(sim.sell_tower(CellPos::new(3, 1)));
+        assert_eq!(sim.tower_price(TowerKind::Gatling), gatling_price_for_third);
+    }
+
+    #[test]
+    fn upgrade_cost_ignores_the_tower_count_markup_a_tower_actually_paid() {
+        let mut sim = Simulation::new();
+        sim.gold = 1_000_000;
+
+        // A Cannon bought cheap (first Tower overall) ...
         let cheap_pos = CellPos::new(1, 1);
         sim.place_tower(cheap_pos, TowerKind::Cannon).unwrap();
         let cheap_upgrade_cost = sim.upgrade_cost_at(cheap_pos).unwrap();
 
-        // ... and one bought at a steep same-Kind markup ...
+        // ... and one bought at a steep total-Tower-count markup ...
         for (i, x) in (2..=6).enumerate() {
             sim.place_tower(CellPos::new(x, 1), TowerKind::Cannon)
                 .unwrap_or_else(|e| panic!("Cannon #{} should place cleanly: {e:?}", i + 2));
