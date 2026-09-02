@@ -197,9 +197,22 @@ const TANK_GOLD_REWARD: i32 = 20;
 const BOSS_GOLD_REWARD: i32 = 60;
 /// Fraction of the Gold spent on a Tower refunded on sale.
 const SELL_REFUND_FRACTION: f32 = 0.7;
-/// Fraction of a Tower's original purchase price each upgrade costs,
-/// flat at every Tier transition (not compounding).
+/// Base fraction of a Tower Kind's price each upgrade costs, scaled up
+/// per target Tier by `UPGRADE_COST_TIER_GROWTH_RATE` — see
+/// `upgrade_cost`.
 const UPGRADE_COST_FRACTION: f32 = 0.8;
+/// How much pricier each further upgrade step is than the last:
+/// reaching Tier `t` costs `UPGRADE_COST_FRACTION * (1 + this * (t -
+/// 1))` of the Kind's base price, so Tier 2 costs the base
+/// `UPGRADE_COST_FRACTION` fraction and Tier 3 costs that fraction
+/// scaled up by `1 + this`. Keeps the *marginal* Gold-per-damage of
+/// finishing a Tower to Tier 3 from beating the marginal value of
+/// stopping at Tier 2, which a flat upgrade cost does not: `damage`
+/// grows by `TIER_STAT_MULTIPLIER` per Tier while a flat cost stays
+/// flat, so the last upgrade step would otherwise be the cheapest
+/// one — this rate roughly cancels that out instead of removing the
+/// upgrade-over-a-fresh-Tower discount entirely.
+const UPGRADE_COST_TIER_GROWTH_RATE: f32 = 0.3;
 /// How steeply a Tower Kind's price climbs with how many of that same
 /// Kind are already on the Grid: buying the `k`-th one of a Kind
 /// (1-indexed — the very first purchase is `k = 1`) costs
@@ -375,6 +388,16 @@ impl TowerTier {
         }
     }
 
+    /// This Tier's 1-indexed position (Tier 1 = 1, Tier 2 = 2, Tier 3
+    /// = 3) — feeds `upgrade_cost`'s per-Tier scaling.
+    fn ordinal(self) -> u32 {
+        match self {
+            TowerTier::One => 1,
+            TowerTier::Two => 2,
+            TowerTier::Three => 3,
+        }
+    }
+
     pub fn is_max(self) -> bool {
         self == TowerTier::Three
     }
@@ -513,13 +536,15 @@ fn fibonacci(n: u32) -> u64 {
     previous
 }
 
-/// Gold cost of one upgrade step: `UPGRADE_COST_FRACTION` of the Tower
-/// Kind's flat base price (`TowerKind::price`, never the same-Kind
-/// markup a particular Tower may have actually paid), rounded to the
-/// nearest whole Gold (.5 away from zero), flat at every Tier
-/// transition.
-fn upgrade_cost(base_price: i32) -> i32 {
-    (base_price as f32 * UPGRADE_COST_FRACTION).round() as i32
+/// Gold cost of upgrading to `target_tier`: the Tower Kind's flat base
+/// price (`TowerKind::price`, never the same-Kind markup a particular
+/// Tower may have actually paid) times `UPGRADE_COST_FRACTION`, scaled
+/// up per `UPGRADE_COST_TIER_GROWTH_RATE` for how far `target_tier` is
+/// past Tier 1 — so Tier 3 costs more to reach than Tier 2 did,
+/// rounded to the nearest whole Gold (.5 away from zero) at each step.
+fn upgrade_cost(base_price: i32, target_tier: TowerTier) -> i32 {
+    let tier_growth = 1.0 + UPGRADE_COST_TIER_GROWTH_RATE * (target_tier.ordinal() as f32 - 1.0);
+    (base_price as f32 * UPGRADE_COST_FRACTION * tier_growth).round() as i32
 }
 
 /// Where an Enemy currently is, for the Bevy layer to render: it sits
@@ -637,10 +662,8 @@ impl Simulation {
     /// not already at the Tier 3 cap — for the Bevy layer's info panel.
     pub fn upgrade_cost_at(&self, pos: CellPos) -> Option<i32> {
         let runtime = self.towers.get(&pos)?;
-        if runtime.tier.is_max() {
-            return None;
-        }
-        Some(upgrade_cost(runtime.kind.price()))
+        let next_tier = runtime.tier.next()?;
+        Some(upgrade_cost(runtime.kind.price(), next_tier))
     }
 
     /// The current shortest Path from Spawn to Goal around all placed
@@ -729,7 +752,7 @@ impl Simulation {
         let Some(next_tier) = runtime.tier.next() else {
             return Err(UpgradeError::AlreadyMaxTier);
         };
-        let cost = upgrade_cost(runtime.kind.price());
+        let cost = upgrade_cost(runtime.kind.price(), next_tier);
         if self.gold < cost {
             return Err(UpgradeError::InsufficientGold);
         }
@@ -1641,12 +1664,16 @@ mod tests {
         );
         let marked_up_upgrade_cost = sim.upgrade_cost_at(marked_up_pos).unwrap();
 
-        // ... should both upgrade for the same flat cost, tied to the
-        // Kind's base price rather than what either Tower actually paid.
+        // ... should both cost the same to reach Tier 2, tied to the
+        // Kind's base price and target Tier rather than what either
+        // Tower actually paid to place.
         assert_eq!(cheap_upgrade_cost, marked_up_upgrade_cost);
         assert_eq!(
             cheap_upgrade_cost,
-            (TowerKind::Cannon.price() as f32 * UPGRADE_COST_FRACTION).round() as i32
+            (TowerKind::Cannon.price() as f32
+                * UPGRADE_COST_FRACTION
+                * (1.0 + UPGRADE_COST_TIER_GROWTH_RATE))
+                .round() as i32
         );
     }
 
@@ -1700,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrading_increases_damage_thirty_percent_per_tier_and_deducts_a_flat_cost() {
+    fn upgrading_increases_damage_thirty_percent_per_tier_and_deducts_a_growing_cost() {
         let mut sim = Simulation::new();
         sim.gold = 100_000;
         let pos = CellPos::new(5, 5);
@@ -1710,16 +1737,37 @@ mod tests {
         assert_eq!(tier_one_damage, TowerKind::Cannon.base_damage());
 
         let cost_to_tier_two = sim.upgrade_cost_at(pos).unwrap();
+        assert_eq!(
+            cost_to_tier_two,
+            (TowerKind::Cannon.price() as f32
+                * UPGRADE_COST_FRACTION
+                * (1.0 + UPGRADE_COST_TIER_GROWTH_RATE))
+                .round() as i32,
+            "Tier 2 should cost the base upgrade fraction scaled for one step past Tier 1"
+        );
         assert!(sim.upgrade_tower(pos).is_ok());
         let after_tier_two = sim.tower_stats_at(pos).unwrap();
         assert_eq!(after_tier_two.tier, TowerTier::Two);
         assert!((after_tier_two.damage - tier_one_damage * TIER_STAT_MULTIPLIER).abs() < 0.001);
         assert_eq!(sim.gold(), gold_after_buying - cost_to_tier_two);
 
-        // The upgrade cost is flat (a fraction of the *original*
-        // purchase price), not compounding with each Tier.
+        // Reaching Tier 3 costs more than reaching Tier 2 did — the
+        // per-Tier growth keeps finishing a Tower to Tier 3 from being
+        // *more* Gold-efficient than stopping at Tier 2, which a flat
+        // upgrade cost would allow (damage keeps compounding by
+        // TIER_STAT_MULTIPLIER while a flat cost wouldn't).
         let cost_to_tier_three = sim.upgrade_cost_at(pos).unwrap();
-        assert_eq!(cost_to_tier_three, cost_to_tier_two);
+        assert!(
+            cost_to_tier_three > cost_to_tier_two,
+            "Tier 3 should cost more to reach than Tier 2 did"
+        );
+        assert_eq!(
+            cost_to_tier_three,
+            (TowerKind::Cannon.price() as f32
+                * UPGRADE_COST_FRACTION
+                * (1.0 + UPGRADE_COST_TIER_GROWTH_RATE * 2.0))
+                .round() as i32
+        );
         assert!(sim.upgrade_tower(pos).is_ok());
         let after_tier_three = sim.tower_stats_at(pos).unwrap();
         assert_eq!(after_tier_three.tier, TowerTier::Three);
