@@ -200,6 +200,13 @@ const SELL_REFUND_FRACTION: f32 = 0.7;
 /// Fraction of a Tower's original purchase price each upgrade costs,
 /// flat at every Tier transition (not compounding).
 const UPGRADE_COST_FRACTION: f32 = 0.8;
+/// How steeply a Tower Kind's price climbs with how many of that same
+/// Kind are already on the Grid: buying the `n`-th one (0-indexed, so
+/// the very first is `n = 0`) costs `price() * (1 + this * ln(n + 1))`.
+/// Discourages spamming a single Kind without capping it outright;
+/// selling one back lowers the price of the next purchase too, since
+/// this reads currently-placed count, not lifetime purchases.
+const SAME_KIND_PRICE_GROWTH_RATE: f32 = 0.25;
 /// Multiplier applied to a Tower's primary stat per Tier over Tier 1.
 const TIER_STAT_MULTIPLIER: f32 = 1.3;
 
@@ -625,6 +632,28 @@ impl Simulation {
         self.shortest_path(self.grid.spawn(), Some(pos))
     }
 
+    /// How many Tower of `kind` are currently on the Grid — the count
+    /// `tower_price` scales off. Selling one back lowers this, and so
+    /// the price of the next purchase of that Kind.
+    fn count_of_kind(&self, kind: TowerKind) -> u32 {
+        self.towers
+            .values()
+            .filter(|runtime| runtime.kind == kind)
+            .count() as u32
+    }
+
+    /// The Gold cost to place a fresh Tower of `kind` right now: its
+    /// base `TowerKind::price`, marked up by `SAME_KIND_PRICE_GROWTH_RATE`
+    /// times the natural log of one plus how many of that Kind are
+    /// already placed — the first Tower of a Kind always costs exactly
+    /// `kind.price()`. Public so the Bevy layer can label the sidebar's
+    /// Tower Kind buttons with the price the next click would pay.
+    pub fn tower_price(&self, kind: TowerKind) -> i32 {
+        let count = self.count_of_kind(kind);
+        let multiplier = 1.0 + SAME_KIND_PRICE_GROWTH_RATE * (count as f32 + 1.0).ln();
+        (kind.price() as f32 * multiplier).round() as i32
+    }
+
     /// Whether a Tower of the given Kind could be placed at `pos` right
     /// now, and if not, why.
     pub fn can_place(&self, pos: CellPos, kind: TowerKind) -> Result<(), PlacementError> {
@@ -637,7 +666,7 @@ impl Simulation {
         if self.towers.contains_key(&pos) {
             return Err(PlacementError::AlreadyOccupied);
         }
-        if self.gold < kind.price() {
+        if self.gold < self.tower_price(kind) {
             return Err(PlacementError::InsufficientGold);
         }
         if self.shortest_path(self.grid.spawn(), Some(pos)).is_none() {
@@ -648,7 +677,7 @@ impl Simulation {
 
     pub fn place_tower(&mut self, pos: CellPos, kind: TowerKind) -> Result<(), PlacementError> {
         self.can_place(pos, kind)?;
-        let price = kind.price();
+        let price = self.tower_price(kind);
         self.gold -= price;
         self.towers.insert(
             pos,
@@ -1507,6 +1536,43 @@ mod tests {
             .expect("an uncritical Cell should be a legal placement");
 
         assert_eq!(sim.gold(), starting_gold - TowerKind::Cannon.price());
+    }
+
+    #[test]
+    fn placing_more_of_the_same_kind_raises_its_price_logarithmically() {
+        let mut sim = Simulation::new();
+        sim.gold = 100_000;
+        assert_eq!(
+            sim.tower_price(TowerKind::Cannon),
+            TowerKind::Cannon.price()
+        );
+
+        sim.place_tower(CellPos::new(1, 1), TowerKind::Cannon)
+            .unwrap();
+        let price_for_second = sim.tower_price(TowerKind::Cannon);
+        assert!(
+            price_for_second > TowerKind::Cannon.price(),
+            "a second Cannon should cost more than the first"
+        );
+
+        sim.place_tower(CellPos::new(2, 1), TowerKind::Cannon).unwrap();
+        let price_for_third = sim.tower_price(TowerKind::Cannon);
+        let second_step = price_for_second - TowerKind::Cannon.price();
+        let third_step = price_for_third - price_for_second;
+        assert!(
+            third_step < second_step,
+            "each further Cannon should cost more, but by a shrinking amount (log growth)"
+        );
+
+        // A different Kind is unaffected by how many Cannon are placed.
+        assert_eq!(
+            sim.tower_price(TowerKind::Gatling),
+            TowerKind::Gatling.price()
+        );
+
+        // Selling a Cannon lowers the price of the next one again.
+        assert!(sim.sell_tower(CellPos::new(2, 1)));
+        assert_eq!(sim.tower_price(TowerKind::Cannon), price_for_second);
     }
 
     #[test]

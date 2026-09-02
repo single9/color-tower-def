@@ -74,6 +74,7 @@ fn main() {
                 sync_lives_text,
                 sync_wave_ui,
                 sync_level_text,
+                sync_tower_price_labels,
                 sync_grid_cells,
                 sync_result_overlay,
             )
@@ -97,6 +98,15 @@ struct SelectedTowerKind(TowerKind);
 /// re-highlight whichever is currently selected.
 #[derive(Component)]
 struct TowerKindButton(TowerKind);
+
+/// Marks a Tower Kind button's label text, so `sync_tower_price_labels`
+/// can keep its displayed price in sync with `simulation` state — it
+/// climbs as more of that Kind gets placed (see `Simulation::tower_price`).
+#[derive(Component)]
+struct TowerPriceLabel {
+    display_name: &'static str,
+    kind: TowerKind,
+}
 
 /// Marks the Tower sprite placed at a given Cell, so it can be found
 /// again on sell.
@@ -462,8 +472,12 @@ fn spawn_sidebar(mut commands: Commands, sim: Res<SimState>) {
                     ))
                     .with_children(|button| {
                         button.spawn((
-                            Text::new(format!("{label} ({}g)", kind.price())),
+                            Text::new(format!("{label} ({}g)", sim.0.tower_price(kind))),
                             TextColor(Color::WHITE),
+                            TowerPriceLabel {
+                                display_name: label,
+                                kind,
+                            },
                         ));
                     });
             }
@@ -1091,6 +1105,15 @@ fn sync_level_text(sim: Res<SimState>, mut text: Query<&mut Text, With<LevelText
         return;
     };
     text.0 = format!("Level: {}/{}", sim.0.level_number(), simulation::LEVEL_COUNT);
+}
+
+/// Keeps each Tower Kind button's price label in sync with
+/// `simulation` state: it climbs as more of that Kind gets placed (see
+/// `Simulation::tower_price`) and eases back down when one is sold.
+fn sync_tower_price_labels(sim: Res<SimState>, mut labels: Query<(&mut Text, &TowerPriceLabel)>) {
+    for (mut text, label) in &mut labels {
+        text.0 = format!("{} ({}g)", label.display_name, sim.0.tower_price(label.kind));
+    }
 }
 
 /// Spawns the (initially empty) full-window container the result
