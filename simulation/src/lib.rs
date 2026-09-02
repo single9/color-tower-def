@@ -175,7 +175,7 @@ const BOSS_SPEED_CELLS_PER_SEC: f32 = 1.0;
 const CANNON_DAMAGE: f32 = 50.0;
 const CANNON_RANGE_CELLS: f32 = 5.0;
 const CANNON_COOLDOWN_SECONDS: f32 = 1.0;
-const GATLING_DAMAGE: f32 = 15.0;
+const GATLING_DAMAGE: f32 = 11.0;
 const GATLING_RANGE_CELLS: f32 = 4.0;
 const GATLING_COOLDOWN_SECONDS: f32 = 0.25;
 const FROST_RANGE_CELLS: f32 = 3.5;
@@ -189,7 +189,7 @@ const PROJECTILE_HIT_DISTANCE_CELLS: f32 = 0.25;
 /// Gold economy balance numbers pending playtesting.
 const STARTING_GOLD: i32 = 180;
 const CANNON_PRICE: i32 = 100;
-const GATLING_PRICE: i32 = 80;
+const GATLING_PRICE: i32 = 90;
 const FROST_PRICE: i32 = 120;
 const GRUNT_GOLD_REWARD: i32 = 10;
 const RUNNER_GOLD_REWARD: i32 = 6;
